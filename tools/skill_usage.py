@@ -210,15 +210,19 @@ def _read_hub_installed_names() -> Set[str]:
     if not lock_path.exists():
         return set()
     try:
-        # Tolerate non-UTF-8 bytes in the lock file. Hub descriptions can carry
-        # Windows-1252 typographic chars (em-dash 0x97, smart quotes, bullets)
-        # written as single high bytes; a strict utf-8 read raises
-        # UnicodeDecodeError, which is a ValueError sibling (not OSError/
-        # JSONDecodeError) so it escapes the handler below and 500s the whole
-        # /api/skills endpoint. errors="replace" degrades the offending byte to
-        # U+FFFD, keeping the (structurally valid) JSON — and every other
-        # skill — readable. See #68053.
-        data = json.loads(lock_path.read_text(encoding="utf-8", errors="replace"))
+        # Try UTF-8 first, then fall back to common Chinese encodings
+        # (Windows systems with Chinese locale may write lock.json in GBK).
+        # Also tolerates Windows-1252 typographic chars via latin-1 fallback.
+        # See #68053.
+        raw = lock_path.read_bytes()
+        for encoding in ("utf-8", "gbk", "gb2312", "gb18030", "latin-1"):
+            try:
+                data = json.loads(raw.decode(encoding))
+                break
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+        else:
+            return set()
         if isinstance(data, dict):
             installed = data.get("installed") or {}
             if isinstance(installed, dict):
@@ -649,8 +653,6 @@ def _empty_record() -> Dict[str, Any]:
         "last_used_at": None,
         "last_viewed_at": None,
         "patch_count": 0,
-        "patch_generation": 0,
-        "last_reused_patch_generation": 0,
         "last_patched_at": None,
         "created_at": _now_iso(),
         "state": STATE_ACTIVE,
@@ -679,8 +681,8 @@ def load_usage() -> Dict[str, Dict[str, Any]]:
     return clean
 
 
-def save_usage(data: Dict[str, Dict[str, Any]]) -> bool:
-    """Write the usage map atomically and report whether it committed."""
+def save_usage(data: Dict[str, Dict[str, Any]]) -> None:
+    """Write the usage map atomically. Best-effort — errors are logged, not raised."""
     path = _usage_file()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -693,7 +695,6 @@ def save_usage(data: Dict[str, Dict[str, Any]]) -> bool:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_path, path)
-            return True
         except BaseException:
             try:
                 os.unlink(tmp_path)
@@ -702,7 +703,6 @@ def save_usage(data: Dict[str, Dict[str, Any]]) -> bool:
             raise
     except Exception as e:
         logger.debug("Failed to write %s: %s", path, e, exc_info=True)
-        return False
 
 
 def get_record(skill_name: str) -> Dict[str, Any]:
@@ -740,7 +740,7 @@ def seed_record_if_missing(skill_name: str) -> None:
         logger.debug("skill_usage.seed_record_if_missing(%s) failed: %s", skill_name, e, exc_info=True)
 
 
-def _mutate(skill_name: str, mutator, *, require_curation_eligible: bool = False) -> Any:
+def _mutate(skill_name: str, mutator, *, require_curation_eligible: bool = False) -> None:
     """Load, apply *mutator(record)* in place, save. Best-effort.
 
     By default this records telemetry for ANY skill — bundled, hub-installed,
@@ -752,97 +752,20 @@ def _mutate(skill_name: str, mutator, *, require_curation_eligible: bool = False
     hub-installed skill).
     """
     if not skill_name:
-        return None
+        return
     try:
         if require_curation_eligible and not is_curation_eligible(skill_name):
-            return None
+            return
         with _usage_file_lock():
             data = load_usage()
             rec = data.get(skill_name)
             if not isinstance(rec, dict):
                 rec = _empty_record()
-            result = mutator(rec)
+            mutator(rec)
             data[skill_name] = rec
-            if not save_usage(data):
-                return None
-            return result
+            save_usage(data)
     except Exception as e:
         logger.debug("skill_usage._mutate(%s) failed: %s", skill_name, e, exc_info=True)
-        return None
-
-
-def _non_negative_int(value: Any) -> int:
-    if isinstance(value, bool):
-        return 0
-    try:
-        return max(0, int(value or 0))
-    except (TypeError, ValueError):
-        return 0
-
-
-def telemetry_provenance(
-    skill_name: str,
-    record: Optional[Dict[str, Any]] = None,
-) -> str:
-    """Return the bounded provenance used by shared skill metrics."""
-    if is_hub_installed(skill_name) or is_bundled(skill_name):
-        return "installed"
-    if ":" in skill_name:
-        try:
-            from hermes_cli.plugins import get_plugin_manager
-
-            if get_plugin_manager().find_plugin_skill(skill_name) is not None:
-                return "installed"
-        except Exception:
-            pass
-    if isinstance(record, dict):
-        created_by = record.get("created_by")
-        if created_by == "installed":
-            return "installed"
-        if created_by == "agent":
-            return "agent_created"
-    if _find_external_skill_dir(skill_name) is not None:
-        return "external"
-    if _find_skill_dir(skill_name) is not None or isinstance(record, dict):
-        return "local"
-    return "unknown"
-
-
-def _emit_skill_lifecycle(
-    skill_name: str,
-    action: str,
-    *,
-    record: Optional[Dict[str, Any]] = None,
-    task_id: Optional[str] = None,
-    session_id: Optional[str] = None,
-    use_count: Optional[int] = None,
-    reused: Optional[bool] = None,
-    reuse_after_patch: Optional[bool] = None,
-) -> None:
-    """Emit one best-effort lifecycle fact after authoritative state changes."""
-    try:
-        from hermes_cli.lifecycle import has_hook, invoke_hook
-
-        if not has_hook("on_skill_lifecycle"):
-            return
-        invoke_hook(
-            "on_skill_lifecycle",
-            action=action,
-            skill_name=skill_name,
-            provenance=telemetry_provenance(skill_name, record),
-            task_id=task_id or "",
-            session_id=session_id or "",
-            use_count=use_count,
-            reused=reused,
-            reuse_after_patch=reuse_after_patch,
-        )
-    except Exception:
-        logger.debug(
-            "skill_usage lifecycle hook failed for %s/%s",
-            skill_name,
-            action,
-            exc_info=True,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -856,127 +779,32 @@ def bump_view(skill_name: str) -> None:
     included. Usage telemetry is observability, not a curation signal.
     """
     def _apply(rec: Dict[str, Any]) -> None:
-        rec["view_count"] = _non_negative_int(rec.get("view_count")) + 1
+        rec["view_count"] = int(rec.get("view_count") or 0) + 1
         rec["last_viewed_at"] = _now_iso()
     _mutate(skill_name, _apply)
 
 
-def bump_use(
-    skill_name: str,
-    *,
-    task_id: Optional[str] = None,
-    session_id: Optional[str] = None,
-) -> None:
+def bump_use(skill_name: str) -> None:
     """Bump use_count and last_used_at. Called when a skill is actively used
     (e.g. loaded into the prompt path or referenced from an assistant turn).
 
     Tracks every skill regardless of provenance.
     """
-    def _apply(rec: Dict[str, Any]) -> Dict[str, Any]:
-        previous_use_count = _non_negative_int(rec.get("use_count"))
-        patch_generation = _non_negative_int(rec.get("patch_generation"))
-        last_reused_generation = min(
-            _non_negative_int(rec.get("last_reused_patch_generation")),
-            patch_generation,
-        )
-        reused = previous_use_count > 0
-        reuse_after_patch = reused and patch_generation > last_reused_generation
-        rec["use_count"] = previous_use_count + 1
+    def _apply(rec: Dict[str, Any]) -> None:
+        rec["use_count"] = int(rec.get("use_count") or 0) + 1
         rec["last_used_at"] = _now_iso()
-        rec["patch_generation"] = patch_generation
-        rec["last_reused_patch_generation"] = last_reused_generation
-        if reuse_after_patch:
-            rec["last_reused_patch_generation"] = patch_generation
-        return {
-            "created_by": rec.get("created_by"),
-            "use_count": rec["use_count"],
-            "reused": reused,
-            "reuse_after_patch": reuse_after_patch,
-        }
-
-    facts = _mutate(skill_name, _apply)
-    if isinstance(facts, dict):
-        _emit_skill_lifecycle(
-            skill_name,
-            "loaded",
-            record=facts,
-            task_id=task_id,
-            session_id=session_id,
-            use_count=facts["use_count"],
-            reused=facts["reused"],
-            reuse_after_patch=facts["reuse_after_patch"],
-        )
+    _mutate(skill_name, _apply)
 
 
-def bump_patch(
-    skill_name: str,
-    *,
-    action: str = "patch",
-    task_id: Optional[str] = None,
-    session_id: Optional[str] = None,
-) -> None:
+def bump_patch(skill_name: str) -> None:
     """Bump patch_count and last_patched_at. Called from skill_manage (patch/edit).
 
     Tracks every skill regardless of provenance.
     """
-    lifecycle_action = "patched" if action == "patch" else "edited"
-
-    def _apply(rec: Dict[str, Any]) -> Dict[str, Any]:
-        rec["patch_count"] = _non_negative_int(rec.get("patch_count")) + 1
-        rec["patch_generation"] = _non_negative_int(rec.get("patch_generation")) + 1
+    def _apply(rec: Dict[str, Any]) -> None:
+        rec["patch_count"] = int(rec.get("patch_count") or 0) + 1
         rec["last_patched_at"] = _now_iso()
-        return {"created_by": rec.get("created_by")}
-
-    facts = _mutate(skill_name, _apply)
-    if isinstance(facts, dict):
-        _emit_skill_lifecycle(
-            skill_name,
-            lifecycle_action,
-            record=facts,
-            task_id=task_id,
-            session_id=session_id,
-        )
-
-
-def record_created(
-    skill_name: str,
-    *,
-    agent_created: bool,
-    task_id: Optional[str] = None,
-    session_id: Optional[str] = None,
-) -> None:
-    """Persist explicit creation provenance and emit a successful create fact."""
-    def _apply(rec: Dict[str, Any]) -> Dict[str, Any]:
-        # A successful create is a new logical skill even if stale sidecar
-        # state survived an earlier deletion or manual filesystem change.
-        rec.clear()
-        rec.update(_empty_record())
-        if agent_created:
-            rec["created_by"] = "agent"
-        return {"created_by": rec["created_by"]}
-
-    facts = _mutate(skill_name, _apply)
-    if isinstance(facts, dict):
-        _emit_skill_lifecycle(
-            skill_name,
-            "created",
-            record=facts,
-            task_id=task_id,
-            session_id=session_id,
-        )
-
-
-def record_installed(skill_name: str) -> None:
-    """Record a successful Skills Hub install without exporting its name."""
-    def _apply(rec: Dict[str, Any]) -> Dict[str, Any]:
-        rec["created_by"] = "installed"
-        rec["state"] = STATE_ACTIVE
-        rec["archived_at"] = None
-        return {"created_by": rec["created_by"]}
-
-    facts = _mutate(skill_name, _apply)
-    if isinstance(facts, dict):
-        _emit_skill_lifecycle(skill_name, "installed", record=facts)
+    _mutate(skill_name, _apply)
 
 
 def mark_agent_created(skill_name: str) -> None:
@@ -996,32 +824,13 @@ def set_state(skill_name: str, state: str) -> None:
     if state not in _VALID_STATES:
         logger.debug("set_state: invalid state %r for %s", state, skill_name)
         return
-    def _apply(rec: Dict[str, Any]) -> Dict[str, Any]:
-        previous_state = rec.get("state")
-        if previous_state == state:
-            return {"changed": False, "created_by": rec.get("created_by")}
+    def _apply(rec: Dict[str, Any]) -> None:
         rec["state"] = state
         if state == STATE_ARCHIVED:
             rec["archived_at"] = _now_iso()
         elif state == STATE_ACTIVE:
             rec["archived_at"] = None
-        return {
-            "changed": True,
-            "created_by": rec.get("created_by"),
-            "previous_state": previous_state,
-        }
-
-    facts = _mutate(skill_name, _apply, require_curation_eligible=True)
-    if not isinstance(facts, dict) or not facts.get("changed"):
-        return
-    action = {
-        STATE_ARCHIVED: "archived",
-        STATE_STALE: "stale",
-    }.get(state)
-    if state == STATE_ACTIVE and facts.get("previous_state") == STATE_ARCHIVED:
-        action = "restored"
-    if action is not None:
-        _emit_skill_lifecycle(skill_name, action, record=facts)
+    _mutate(skill_name, _apply, require_curation_eligible=True)
 
 
 def set_pinned(skill_name: str, pinned: bool) -> None:

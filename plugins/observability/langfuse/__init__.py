@@ -605,6 +605,17 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
                       turn_id: str = "", api_request_id: str = "") -> TraceState:
     trace_id = client.create_trace_id(seed=f"{session_id or 'sessionless'}::{task_id or task_key}")
     trace_input = _extract_last_user_message(messages)
+
+    # Read user identity from session context for Langfuse tracing.
+    _user_id = ""
+    _user_name = ""
+    try:
+        from gateway.session_context import get_session_env
+        _user_id = get_session_env("HERMES_SESSION_USER_ID", "")
+        _user_name = get_session_env("HERMES_SESSION_USER_NAME", "")
+    except Exception:
+        pass
+
     metadata = {
         "source": "hermes",
         "task_id": task_id,
@@ -614,6 +625,8 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         "provider": provider,
         "model": model,
         "api_mode": api_mode,
+        "user_id": _user_id or None,
+        "user_name": _user_name or None,
     }
 
     # session_id must be passed in trace_context for Langfuse session grouping.
@@ -625,6 +638,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         try:
             with propagate_attributes(
                 session_id=session_id or task_key,
+                user_id=_user_id or None,
                 trace_name="Hermes turn",
                 tags=["hermes", "langfuse"],
             ):
@@ -657,6 +671,13 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
             end_on_exit=False,
         )
         root_span = root_ctx.__enter__()
+
+    # Set user_id at trace level for Langfuse Users page statistics.
+    if _user_id:
+        try:
+            root_span.update_trace(user_id=_user_id)
+        except Exception:
+            pass
 
     try:
         root_span.set_trace_io(input=trace_input)
