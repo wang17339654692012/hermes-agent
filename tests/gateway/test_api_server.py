@@ -2866,3 +2866,48 @@ class TestCreateAgentModelRecovery:
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
 
+
+
+class TestExtractUserInfo:
+    """``APIServerAdapter._extract_user_info`` user-identity plumbing."""
+
+    def _request(self, headers):
+        return type("FakeRequest", (), {"headers": headers})()
+
+    def test_headers_take_priority_over_body_user(self):
+        req = self._request({"X-Hermes-User-Id": "alice@corp.com", "X-Hermes-User-Name": "Alice"})
+        uid, uname = APIServerAdapter._extract_user_info(req, {"user": "body-user"})
+        assert uid == "alice@corp.com"
+        assert uname == "Alice"
+
+    def test_falls_back_to_body_user_field(self):
+        req = self._request({})
+        uid, uname = APIServerAdapter._extract_user_info(req, {"user": "body-user-7"})
+        assert uid == "body-user-7"
+        assert uname == ""
+
+    def test_empty_when_no_identity(self):
+        req = self._request({})
+        uid, uname = APIServerAdapter._extract_user_info(req, {})
+        assert uid == ""
+        assert uname == ""
+
+    def test_truncates_long_values(self):
+        req = self._request({"X-Hermes-User-Id": "x" * 500})
+        uid, uname = APIServerAdapter._extract_user_info(req, None)
+        assert len(uid) == 256
+        assert uname == ""
+
+    def test_binds_user_identity_into_session_context(self):
+        from gateway.session_context import clear_session_vars, get_session_env
+
+        req = self._request({"X-Hermes-User-Id": "alice@corp.com", "X-Hermes-User-Name": "Alice"})
+        uid, uname = APIServerAdapter._extract_user_info(req, {"user": "ignored"})
+        tokens = APIServerAdapter._bind_api_server_session(
+            chat_id="s1", session_key="k1", session_id="s1", user_id=uid, user_name=uname
+        )
+        try:
+            assert get_session_env("HERMES_SESSION_USER_ID") == "alice@corp.com"
+            assert get_session_env("HERMES_SESSION_USER_NAME") == "Alice"
+        finally:
+            clear_session_vars(tokens)

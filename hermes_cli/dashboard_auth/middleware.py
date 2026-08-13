@@ -62,6 +62,7 @@ _GATE_PUBLIC_PREFIXES: tuple[str, ...] = (
     "/ds-assets/",
     "/fonts/",
     "/fonts-terminal/",
+    "/v1/",  # API server endpoints use their own Bearer token auth (_check_auth)
 )
 
 

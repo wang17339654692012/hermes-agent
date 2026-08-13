@@ -775,7 +775,11 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
                 _end_observation(observation)
         final_output = _merge_trace_output(output, state)
         if final_output is not None:
-            state.root_span.set_trace_io(output=final_output)
+            try:
+                state.root_span.set_trace_io(output=final_output)
+            except Exception:
+                # langfuse < 4.0 has no set_trace_io on LangfuseChain; update/end must still run
+                pass
             state.root_span.update(output=final_output)
         state.root_span.end()
     except Exception as exc:  # pragma: no cover - fail-open

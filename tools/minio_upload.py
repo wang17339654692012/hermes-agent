@@ -88,14 +88,39 @@ MINIO_URL_EXPIRE_HOURS = int(os.getenv("MINIO_URL_EXPIRE_HOURS") or _dotenv.get(
 MINIO_PUBLIC_ENDPOINT = os.getenv("MINIO_PUBLIC_ENDPOINT") or _dotenv.get("MINIO_PUBLIC_ENDPOINT") or ""
 
 
+MINIO_REGION = os.getenv("MINIO_REGION") or _dotenv.get("MINIO_REGION") or "us-east-1"
+
+
 # ---------------------------------------------------------------------------
 # Client (lazy — created on first use so import-time errors are graceful)
 # ---------------------------------------------------------------------------
 _client: Minio | None = None
 
 
-def _get_client() -> Minio:
+def _get_client(endpoint: str | None = None) -> Minio:
+    """Get or create a MinIO client. Uses *endpoint* if provided, otherwise
+    the default ``MINIO_ENDPOINT``.
+
+    When *endpoint* differs from ``MINIO_ENDPOINT`` (i.e. the public endpoint),
+    ``region`` is passed explicitly so the client doesn't need to call
+    ``GetBucketLocation`` (which would fail if the public endpoint is not
+    reachable from this network)."""
     global _client
+    ep = endpoint or MINIO_ENDPOINT
+    if ep != MINIO_ENDPOINT:
+        # Return a separate client for the public endpoint
+        if not MINIO_ACCESS_KEY or not MINIO_SECRET_KEY:
+            raise RuntimeError(
+                "MinIO credentials not configured. Set MINIO_ACCESS_KEY and "
+                "MINIO_SECRET_KEY in .env or the environment."
+            )
+        return Minio(
+            ep,
+            access_key=MINIO_ACCESS_KEY,
+            secret_key=MINIO_SECRET_KEY,
+            secure=MINIO_SECURE,
+            region=MINIO_REGION,
+        )
     if _client is None:
         if not MINIO_ACCESS_KEY or not MINIO_SECRET_KEY:
             raise RuntimeError(
@@ -103,7 +128,7 @@ def _get_client() -> Minio:
                 "MINIO_SECRET_KEY in .env or the environment."
             )
         _client = Minio(
-            MINIO_ENDPOINT,
+            ep,
             access_key=MINIO_ACCESS_KEY,
             secret_key=MINIO_SECRET_KEY,
             secure=MINIO_SECURE,
@@ -161,17 +186,22 @@ def upload_file(
         file_size = path.stat().st_size
         print(f"[OK] Uploaded: {path.name} -> {MINIO_BUCKET}/{object_name} ({file_size:,} bytes)")
 
-        # Build the presigned URL
-        url = client.presigned_get_object(
-            MINIO_BUCKET,
-            object_name,
-            expires=timedelta(hours=MINIO_URL_EXPIRE_HOURS),
-        )
-
-        # Rewrite endpoint if a public endpoint is configured (e.g. when
-        # the MinIO API is on localhost but users download from a LAN IP).
-        if MINIO_PUBLIC_ENDPOINT:
-            url = _rewrite_endpoint(url, MINIO_ENDPOINT, MINIO_PUBLIC_ENDPOINT)
+        # Build the presigned URL.  If MINIO_PUBLIC_ENDPOINT is set, use a
+        # separate client so the signature is computed against the correct
+        # host (string-replacing the host breaks the AWS V4 signature).
+        if MINIO_PUBLIC_ENDPOINT and MINIO_PUBLIC_ENDPOINT != MINIO_ENDPOINT:
+            public_client = _get_client(MINIO_PUBLIC_ENDPOINT)
+            url = public_client.presigned_get_object(
+                MINIO_BUCKET,
+                object_name,
+                expires=timedelta(hours=MINIO_URL_EXPIRE_HOURS),
+            )
+        else:
+            url = client.presigned_get_object(
+                MINIO_BUCKET,
+                object_name,
+                expires=timedelta(hours=MINIO_URL_EXPIRE_HOURS),
+            )
 
         print(f"[OK] Presigned URL ({MINIO_URL_EXPIRE_HOURS}h expiry): {url[:100]}...")
         return url
@@ -185,11 +215,6 @@ def upload_file(
     except Exception as e:
         print(f"[ERROR] Upload failed: {e}")
         return None
-
-
-def _rewrite_endpoint(url: str, internal: str, public: str) -> str:
-    """Replace *internal* host:port with *public* in *url*."""
-    return url.replace(internal, public, 1)
 
 
 # ---------------------------------------------------------------------------

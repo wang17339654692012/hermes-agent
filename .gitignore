@@ -197,3 +197,7 @@ native/fts5_cjk/*.so
 # interrupted; consumed by launch-time recovery. Never commit it (was tracked
 # by accident via 3a69e34702, removed in the #72002 salvage).
 .lazy-refresh-incomplete
+
+docker/migration-backup/
+docker/deploy-192.168.106.31/
+docker-compose.gongwen.yml

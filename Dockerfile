@@ -68,7 +68,9 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 # replaces tini with s6-overlay's /init (PID 1 = s6-svscan), which reaps
 # zombies non-blockingly on SIGCHLD and additionally supervises the main
 # hermes process, the dashboard, and per-profile gateways.
-RUN apt-get -o Acquire::Retries=3 update && \
+# Switch to Aliyun mirror for faster downloads in China.
+RUN sed -i 's|http://deb.debian.org/debian|http://mirrors.aliyun.com/debian|g' /etc/apt/sources.list.d/debian.sources && \
+    apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils && \
     rm -rf /var/lib/apt/lists/*
@@ -265,6 +267,10 @@ RUN cd plugins/platforms/photon/sidecar && \
 COPY pyproject.toml uv.lock ./
 RUN touch ./README.md
 RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra otlp --extra anthropic --extra bedrock --extra azure-identity --extra hindsight --extra matrix
+# MinIO SDK for file uploads (minio-file-upload skill)
+RUN uv pip install --no-cache-dir minio
+# Langfuse SDK for observability (observability/langfuse plugin)
+RUN uv pip install --no-cache-dir "langfuse==4.14.1"
 
 # ---------- Frontend build (cached independently from Python source) ----------
 # Copy only the frontend source trees first so that Python-only changes don't

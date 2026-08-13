@@ -2112,6 +2112,27 @@ class APIServerAdapter(BasePlatformAdapter):
     # that the sanitized form is safe to pass into Honcho / state.db.
     _MAX_SESSION_HEADER_LEN = 256
 
+    @staticmethod
+    def _extract_user_info(
+        request: "web.Request",
+        body: Optional[Dict[str, Any]] = None,
+    ) -> tuple[str, str]:
+        """Extract user identity from request headers or body.
+
+        Reads `X-Hermes-User-Id` / `X-Hermes-User-Name` headers first
+        (highest priority), then falls back to the OpenAI-standard `user`
+        field in the request body.
+
+        Returns `(user_id, user_name)` — both may be empty strings.
+        """
+        user_id = request.headers.get("X-Hermes-User-Id", "").strip()
+        user_name = request.headers.get("X-Hermes-User-Name", "").strip()
+        if not user_id and isinstance(body, dict):
+            user_val = body.get("user", "")
+            if isinstance(user_val, str) and user_val.strip():
+                user_id = user_val.strip()
+        return user_id[:256], user_name[:256]
+
     def _parse_session_key_header(
         self, request: "web.Request"
     ) -> tuple[Optional[str], Optional["web.Response"]]:
@@ -2915,6 +2936,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
+            "load_soul_identity": True,
         }
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
@@ -3724,6 +3746,8 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             if selection_error:
                 return web.json_response(_openai_error(selection_error), status=400)
+        # Extract user identity for Langfuse tracing.
+        api_user_id, api_user_name = self._extract_user_info(request, body)
         history = await self._conversation_history_for_session(session_id)
         result, usage = await self._run_agent(
             user_message=user_message,
@@ -3737,6 +3761,8 @@ class APIServerAdapter(BasePlatformAdapter):
             route_source=runtime_request.get("route_source") or "global",
             confirmed_runtime_lock=lock_active,
             **agent_overrides,
+            user_id=api_user_id,
+            user_name=api_user_name,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -3840,6 +3866,8 @@ class APIServerAdapter(BasePlatformAdapter):
             model_lock=("accepted" if lock_active else ""),
         )
 
+        api_user_id, api_user_name = self._extract_user_info(request, body)
+
         loop = asyncio.get_running_loop()
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
         message_id = f"msg_{uuid.uuid4().hex}"
@@ -3902,6 +3930,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     route_source=runtime_request.get("route_source") or "global",
                     confirmed_runtime_lock=lock_active,
                     **agent_overrides,
+                    user_id=api_user_id,
+                    user_name=api_user_name,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -4092,6 +4122,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if key_err is not None:
             return key_err
 
+        # Extract user identity for Langfuse tracing.
+        api_user_id, api_user_name = self._extract_user_info(request, body)
+
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
         #
@@ -4259,6 +4292,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                user_id=api_user_id,
+                user_name=api_user_name,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -4280,6 +4315,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                user_id=api_user_id,
+                user_name=api_user_name,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -5315,6 +5352,10 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
+
+        # Extract user identity for Langfuse tracing.
+        api_user_id, api_user_name = self._extract_user_info(request, body)
+
         if stream:
             # Streaming branch — emit OpenAI Responses SSE events as the
             # agent runs so frontends can render text deltas and tool
@@ -5370,6 +5411,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                user_id=api_user_id,
+                user_name=api_user_name,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -5405,6 +5448,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                user_id=api_user_id,
+                user_name=api_user_name,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -6080,6 +6125,8 @@ class APIServerAdapter(BasePlatformAdapter):
         chat_id: str = "",
         session_key: str = "",
         session_id: str = "",
+        user_id: str = "",
+        user_name: str = "",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -6103,6 +6150,8 @@ class APIServerAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
+            user_id=user_id,
+            user_name=user_name,
             async_delivery=False,
             cron_session="",
         )
@@ -6127,6 +6176,8 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        user_id: str = "",
+        user_name: str = "",
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -6167,6 +6218,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
+                    user_id=user_id,
+                    user_name=user_name,
                 )
                 agent = None
                 try:

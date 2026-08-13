@@ -98,6 +98,11 @@ plans/
 .plans/
 
 # Repo-level dotfiles that are git-only or dev-tooling config
+
+# Local deployment artifacts (docker/deploy-*): tarballs/scripts must NOT leak
+# into the image — they previously inflated the image by ~2.5GB (the image was
+# embedding hermes-gongwen-image.tar + hermes-data.tar.gz).
+docker/deploy-192.168.106.31/
 .env.example
 .envrc
 .gitattributes
