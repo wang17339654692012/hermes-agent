@@ -66,9 +66,11 @@ class ReviewOrchestrator:
 
         logger.info("Step 1/6: 解析完成, %d 个段落", len(paragraphs))
 
-        # ── Step 2: LLM 内容分析 ──
+        # ── Step 2: LLM 内容分析（含文种识别）──
         try:
-            analysis = await self._analyze_content(paragraphs, skill)
+            analysis = await self._analyze_content(
+                paragraphs, skill, known_doc_type=self.doc_type
+            )
         except Exception as e:
             logger.error("内容分析失败: %s", e)
             return {"error": f"内容分析失败: {e}"}
@@ -92,12 +94,13 @@ class ReviewOrchestrator:
 
         logger.info("Step 3/6: 检索完成, %d 条参考材料", len(refs))
 
-        # ── Step 4: 逐段对比审核（标准来自技能）──
+        # ── Step 4: 逐段对比审核（标准来自技能，文种来自分析结果）──
         try:
             annotations = await compare_paragraphs(
                 paragraphs=paragraphs,
                 refs=refs,
                 skill=skill,
+                doc_type=analysis.get("doc_type"),
             )
         except Exception as e:
             logger.error("审核失败: %s", e)
@@ -134,32 +137,46 @@ class ReviewOrchestrator:
 
         # ── Step 6-7: 生成批注 + 上传（仅 annotate=true 时）──
         if self.annotate:
-            try:
-                annotated_bytes = await generate_annotated_docx(
-                    self.file_bytes, self.filename, paragraphs, annotations
-                )
-                download_url = await self._upload_to_minio(
-                    annotated_bytes, self.filename
-                )
-                result["download_url"] = download_url
-                result["summary"]["duration_seconds"] = round(time.time() - t0, 1)
-                logger.info("Step 6-7/6: 批注文档已生成并上传")
-            except Exception as e:
-                logger.error("批注文档生成/上传失败: %s", e)
-                result["warning"] = f"批注文档生成失败: {e}，仅返回文字审核意见"
+            if Path(self.filename).suffix.lower() == ".pdf":
+                # Word 批注只能落在 docx 上；PDF 显式降级，不靠异常兜底
+                result["warning"] = "PDF 暂不支持生成批注文档，仅返回文字审核意见"
+                logger.info("Step 6-7/6: PDF 跳过批注生成")
+            else:
+                try:
+                    annotated_bytes = await generate_annotated_docx(
+                        self.file_bytes, self.filename, annotations
+                    )
+                    download_url = await self._upload_to_minio(
+                        annotated_bytes, self.filename
+                    )
+                    result["download_url"] = download_url
+                    result["summary"]["duration_seconds"] = round(time.time() - t0, 1)
+                    logger.info("Step 6-7/6: 批注文档已生成并上传")
+                except Exception as e:
+                    logger.error("批注文档生成/上传失败: %s", e)
+                    result["warning"] = f"批注文档生成失败: {e}，仅返回文字审核意见"
         else:
             logger.info("Step 6-7/6: 跳过 (annotate=false)")
 
         logger.info("审核完成: %s, 耗时 %.1fs", self.filename, result["summary"]["duration_seconds"])
         return result
 
-    async def _analyze_content(self, paragraphs: List[Paragraph], skill: ReviewSkill) -> dict:
-        """调用 LLM 分析文档，识别主题、政治表述、引用文件。"""
+    async def _analyze_content(
+        self,
+        paragraphs: List[Paragraph],
+        skill: ReviewSkill,
+        known_doc_type: Optional[str] = None,
+    ) -> dict:
+        """调用 LLM 分析文档，识别主题、政治表述、引用文件、文种。
+
+        known_doc_type：调用方传入的文种；非 None 时跳过自动识别。
+        """
         prompt = f"""你是一名公文审核专家。请分析以下文档，识别：
 
 1. 文档主题（3-5 个关键词）
 2. 关键政治表述（需要与权威来源核对的固定提法）
 3. 引用的文件、会议、讲话（需要验证准确性和时效性）
+4. 公文文种（如：通知、报告、请示、批复、函、纪要、决定、意见、通报等；无法判断时输出"未知"）
 
 ## 审核标准（来自 document-review 技能）
 
@@ -177,10 +194,14 @@ class ReviewOrchestrator:
   ],
   "references": [
     {{"text": "引用文件/会议/讲话名称", "context": "出现该引用的上下文"}}
-  ]
+  ],
+  "doc_type": "通知"
 }}"""
         response = await _call_llm(prompt)
-        return _parse_json_response(response)
+        analysis = _parse_json_response(response)
+        # 调用方传入文种时以传入值为准，跳过 LLM 识别结果
+        analysis["doc_type"] = known_doc_type or analysis.get("doc_type")
+        return analysis
 
     def _filter(self, annotations: List[Annotation]) -> List[Annotation]:
         if self.severity_filter == "critical":
@@ -212,12 +233,10 @@ class ReviewOrchestrator:
 
 async def _call_llm(prompt: str) -> str:
     """调用 LLM Provider API"""
-    api_url = os.getenv(
-        "LLM_API_URL",
-        "https://api.deepseek.com/v1/chat/completions",
-    )
+    from .settings import resolve_llm_settings
+
+    api_url, model = resolve_llm_settings()
     api_key = os.getenv("LLM_API_KEY") or os.getenv("DEEPSEEK_API_KEY", "")
-    model = os.getenv("LLM_MODEL", "deepseek-chat")
 
     if not api_key:
         raise RuntimeError("LLM_API_KEY 或 DEEPSEEK_API_KEY 未设置")

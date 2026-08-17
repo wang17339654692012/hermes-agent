@@ -92,10 +92,33 @@ MINIO_PUBLIC_ENDPOINT = os.getenv("MINIO_PUBLIC_ENDPOINT") or _dotenv.get("MINIO
 # Client (lazy — created on first use so import-time errors are graceful)
 # ---------------------------------------------------------------------------
 _client: Minio | None = None
+_public_client: Minio | None = None
 
 
-def _get_client() -> Minio:
-    global _client
+def _get_client(public: bool = False) -> Minio:
+    """返回 MinIO client；public=True 时返回按 MINIO_PUBLIC_ENDPOINT 配置的实例。
+
+    presigned URL 的 SigV4 签名绑定 host（SignedHeaders=host），客户端用
+    外部地址访问时若签名 host 是内部名（minio:9000）会验签失败。因此
+    presign 必须用 public client（presigned_get_object 是纯本地签名，
+    不发起连接）；上传连接仍走内部 endpoint。
+    """
+    global _client, _public_client
+    if public:
+        if _public_client is None:
+            if not MINIO_PUBLIC_ENDPOINT:
+                raise RuntimeError("MINIO_PUBLIC_ENDPOINT 未配置，无法生成外部可访问的下载 URL")
+            endpoint = re.sub(r"^https?://", "", MINIO_PUBLIC_ENDPOINT)
+            # 显式指定 region：SDK 未指定时会在 presign 前向 endpoint 发起
+            # bucket location 查询，而 public endpoint 在容器内不可达
+            _public_client = Minio(
+                endpoint,
+                access_key=MINIO_ACCESS_KEY,
+                secret_key=MINIO_SECRET_KEY,
+                secure=MINIO_SECURE,
+                region="us-east-1",
+            )
+        return _public_client
     if _client is None:
         if not MINIO_ACCESS_KEY or not MINIO_SECRET_KEY:
             raise RuntimeError(
@@ -107,6 +130,7 @@ def _get_client() -> Minio:
             access_key=MINIO_ACCESS_KEY,
             secret_key=MINIO_SECRET_KEY,
             secure=MINIO_SECURE,
+            region="us-east-1",
         )
     return _client
 
@@ -161,17 +185,16 @@ def upload_file(
         file_size = path.stat().st_size
         print(f"[OK] Uploaded: {path.name} -> {MINIO_BUCKET}/{object_name} ({file_size:,} bytes)")
 
-        # Build the presigned URL
-        url = client.presigned_get_object(
+        # Build the presigned URL。
+        # 配置了 MINIO_PUBLIC_ENDPOINT 时用 public client 签名，使 URL 的
+        # host 与外部客户端访问地址一致（否则验签 403）；未配置时退回
+        # 内部 endpoint 签名（URL 仅供容器内使用）。
+        signer = _get_client(public=bool(MINIO_PUBLIC_ENDPOINT))
+        url = signer.presigned_get_object(
             MINIO_BUCKET,
             object_name,
             expires=timedelta(hours=MINIO_URL_EXPIRE_HOURS),
         )
-
-        # Rewrite endpoint if a public endpoint is configured (e.g. when
-        # the MinIO API is on localhost but users download from a LAN IP).
-        if MINIO_PUBLIC_ENDPOINT:
-            url = _rewrite_endpoint(url, MINIO_ENDPOINT, MINIO_PUBLIC_ENDPOINT)
 
         print(f"[OK] Presigned URL ({MINIO_URL_EXPIRE_HOURS}h expiry): {url[:100]}...")
         return url
@@ -185,11 +208,6 @@ def upload_file(
     except Exception as e:
         print(f"[ERROR] Upload failed: {e}")
         return None
-
-
-def _rewrite_endpoint(url: str, internal: str, public: str) -> str:
-    """Replace *internal* host:port with *public* in *url*."""
-    return url.replace(internal, public, 1)
 
 
 # ---------------------------------------------------------------------------

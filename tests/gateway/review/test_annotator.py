@@ -14,7 +14,8 @@ from gateway.platforms.review.annotator import (
     SEVERITY_COLORS,
     SEVERITY_LABELS,
 )
-from gateway.platforms.review.models import Annotation, Paragraph
+from gateway.platforms.review.models import Annotation
+from docx.oxml.ns import qn
 
 
 def _make_test_docx() -> bytes:
@@ -27,14 +28,6 @@ def _make_test_docx() -> bytes:
     buf = BytesIO()
     doc.save(buf)
     return buf.getvalue()
-
-
-def _make_test_paragraphs() -> list:
-    return [
-        Paragraph(index=1, text="第一段测试内容。"),
-        Paragraph(index=2, text="第二段测试内容，包含问题。"),
-        Paragraph(index=3, text="第三段正常内容。"),
-    ]
 
 
 def _make_test_annotations() -> list:
@@ -77,21 +70,19 @@ class TestGenerateAnnotatedDocx:
 
     def test_generate_with_annotations(self):
         file_bytes = _make_test_docx()
-        paragraphs = _make_test_paragraphs()
         annotations = _make_test_annotations()
 
-        result = _generate_sync(file_bytes, "test.docx", paragraphs, annotations)
+        result = _generate_sync(file_bytes, "test.docx", annotations)
         assert isinstance(result, bytes)
         assert len(result) > 0
-        # 应该比原始文件大（多了批注和汇总表）
+        # 应该比原始文件大（多了批注）
         assert len(result) > len(file_bytes)
 
     def test_generate_no_annotations(self):
         file_bytes = _make_test_docx()
-        paragraphs = _make_test_paragraphs()
         annotations = []
 
-        result = _generate_sync(file_bytes, "test.docx", paragraphs, annotations)
+        result = _generate_sync(file_bytes, "test.docx", annotations)
         assert isinstance(result, bytes)
         assert len(result) > 0
 
@@ -102,21 +93,19 @@ class TestGenerateAnnotatedDocx:
         buf = BytesIO()
         doc.save(buf)
 
-        result = _generate_sync(buf.getvalue(), "test.docx", [], [])
+        result = _generate_sync(buf.getvalue(), "test.docx", [])
         assert isinstance(result, bytes)
 
     def test_output_is_valid_docx(self):
         from docx import Document
 
         file_bytes = _make_test_docx()
-        paragraphs = _make_test_paragraphs()
         annotations = _make_test_annotations()
 
-        result = _generate_sync(file_bytes, "test.docx", paragraphs, annotations)
+        result = _generate_sync(file_bytes, "test.docx", annotations)
 
         # 验证可以重新打开
         doc = Document(BytesIO(result))
-        # 应该有原始段落 + 汇总表相关内容
         assert len(doc.paragraphs) >= 3
 
     def test_no_summary_table(self):
@@ -124,10 +113,9 @@ class TestGenerateAnnotatedDocx:
         from docx import Document
 
         file_bytes = _make_test_docx()
-        paragraphs = _make_test_paragraphs()
         annotations = _make_test_annotations()
 
-        result = _generate_sync(file_bytes, "test.docx", paragraphs, annotations)
+        result = _generate_sync(file_bytes, "test.docx", annotations)
 
         doc = Document(BytesIO(result))
         for para in doc.paragraphs:
@@ -139,10 +127,9 @@ class TestGenerateAnnotatedDocx:
         from lxml import etree
 
         file_bytes = _make_test_docx()
-        paragraphs = _make_test_paragraphs()
         annotations = _make_test_annotations()
 
-        result = _generate_sync(file_bytes, "test.docx", paragraphs, annotations)
+        result = _generate_sync(file_bytes, "test.docx", annotations)
 
         with zipfile.ZipFile(BytesIO(result), "r") as z:
             assert "word/comments.xml" in z.namelist()
@@ -152,14 +139,42 @@ class TestGenerateAnnotatedDocx:
             comments = root.findall(".//w:comment", ns)
             assert len(comments) == 2  # 2 annotations
 
+    def test_duplicate_text_paragraphs_anchored_by_position(self):
+        """相同文本的两个段落，批注按文档位置锚定而非文本匹配。
+
+        回归测试：文本匹配会把第 2 段的批注错误落到第 1 段（或丢失）。
+        """
+        from docx import Document
+
+        doc = Document()
+        doc.add_paragraph("重复文本段落。")
+        doc.add_paragraph("重复文本段落。")  # 与第 1 段完全相同
+        doc.add_paragraph("独立段落。")
+        buf = BytesIO()
+        doc.save(buf)
+
+        annotations = [
+            Annotation(
+                paragraph_index=2, severity="important", issue_type="T",
+                description="d", suggestion="s", reference="r",
+            ),
+        ]
+
+        result = _generate_sync(buf.getvalue(), "test.docx", annotations)
+
+        out_doc = Document(BytesIO(result))
+        second_para_el = out_doc.paragraphs[1]._element
+        first_para_el = out_doc.paragraphs[0]._element
+        assert second_para_el.find(qn("w:commentRangeStart")) is not None
+        assert first_para_el.find(qn("w:commentRangeStart")) is None
+
     @pytest.mark.asyncio
     async def test_async_wrapper(self):
         file_bytes = _make_test_docx()
-        paragraphs = _make_test_paragraphs()
         annotations = _make_test_annotations()
 
         result = await generate_annotated_docx(
-            file_bytes, "test.docx", paragraphs, annotations
+            file_bytes, "test.docx", annotations
         )
         assert isinstance(result, bytes)
         assert len(result) > 0

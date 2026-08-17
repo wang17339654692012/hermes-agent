@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import re
-from typing import List
+from typing import List, Optional
 
 import aiohttp
 
@@ -20,11 +20,13 @@ async def compare_paragraphs(
     refs: List[dict],
     skill: ReviewSkill,
     batch_size: int = 8,
+    doc_type: Optional[str] = None,
 ) -> List[Annotation]:
     """分批对比审核。
 
     技能注入点：
     - skill.review_standard  → 审核标准 + 防编造约束（作为 system prompt）
+    - doc_type               → 文种声明，模型按对应文种的格式标准审核
     - refs                   → 多轮检索结果（作为参考材料）
     - paragraphs             → 待审核段落
     """
@@ -33,26 +35,8 @@ async def compare_paragraphs(
     # 构建参考材料
     reference_text = _build_reference_text(refs, skill.extract_chars)
 
-    # 构建系统级审核 prompt（来自技能）
-    review_system_prompt = f"""你是一名公文审核专家。请严格按照以下审核标准，逐段对比公文与权威参考材料。
-
-{skill.review_standard}
-
-## 输出格式
-
-对每个有问题的段落，输出一条 JSON。仅输出有问题的段落，无问题不输出。
-
-[
-  {{
-    "paragraph_index": 1,
-    "severity": "critical|important|suggestion",
-    "issue_type": "问题类型",
-    "description": "问题说明",
-    "suggestion": "修改建议",
-    "reference": "参考依据（URL + 日期）",
-    "original_text": "原文摘录（前50字）"
-  }}
-]"""
+    # 构建系统级审核 prompt（标准来自技能，文种决定格式标准）
+    review_system_prompt = _build_review_system_prompt(skill, doc_type)
 
     # 分批处理
     total_batches = (len(paragraphs) + batch_size - 1) // batch_size
@@ -64,13 +48,7 @@ async def compare_paragraphs(
             f"[段落 {p.index}] {p.text}" for p in batch
         )
 
-        user_prompt = f"""## 权威参考材料
-
-{reference_text}
-
-## 待审核段落
-
-{paragraphs_text}"""
+        user_prompt = _build_user_prompt(reference_text, paragraphs_text)
 
         try:
             response = await _call_llm_with_system(
@@ -90,6 +68,68 @@ async def compare_paragraphs(
     return all_annotations
 
 
+def _build_review_system_prompt(skill: ReviewSkill, doc_type: Optional[str]) -> str:
+    """构建逐段审核的 system prompt（标准来自技能，文种决定格式标准）。"""
+    if doc_type:
+        doc_type_decl = f"本文种为：{doc_type}。请按该文种的格式规范审核。"
+    else:
+        doc_type_decl = "文种未识别，请勿假设文种，按通用公文规范审核。"
+
+    return f"""你是一名公文审核专家。请严格按照以下审核标准，逐段对比公文与权威参考材料。
+
+## 文种
+
+{doc_type_decl}
+
+## 审核范围
+
+1. 政策符合性审核：将公文与参考材料对比，检查政策引用是否过期、内容是否与官方发布存在冲突。
+2. 语言与格式审核：检查错别字、语句表达、用词规范性、文章结构合理性及公文格式合规性。
+
+## 审核标准（来自 document-review 技能）
+
+{skill.review_standard}
+
+## 输出格式
+
+对每个有问题的段落，输出一条 JSON。仅输出有问题的段落，无问题不输出。
+
+[
+  {{
+    "paragraph_index": 1,
+    "severity": "critical|important|suggestion",
+    "issue_type": "问题类型",
+    "description": "问题说明",
+    "suggestion": "修改建议",
+    "reference": "参考依据（URL + 日期）",
+    "original_text": "原文摘录（前50字）"
+  }}
+]"""
+
+
+def _build_user_prompt(reference_text: str, paragraphs_text: str) -> str:
+    """构建逐段审核的 user prompt。
+
+    检索无结果时显式注入防编造指令——不依赖模型自觉，
+    避免模型凭空编造政策依据。
+    """
+    if reference_text:
+        refs_section = reference_text
+    else:
+        refs_section = (
+            "（未检索到权威参考材料。本批次仅执行语言与格式审核；"
+            "政策符合性结论需人工核实，禁止引用任何未提供来源的政策内容。）"
+        )
+
+    return f"""## 权威参考材料
+
+{refs_section}
+
+## 待审核段落
+
+{paragraphs_text}"""
+
+
 def _build_reference_text(refs: List[dict], char_limit: int) -> str:
     """构建参考材料文本"""
     parts = []
@@ -105,12 +145,10 @@ def _build_reference_text(refs: List[dict], char_limit: int) -> str:
 
 async def _call_llm_with_system(system_prompt: str, user_prompt: str) -> str:
     """调用 LLM，带 system prompt"""
-    api_url = os.getenv(
-        "LLM_API_URL",
-        "https://api.deepseek.com/v1/chat/completions",
-    )
+    from .settings import resolve_llm_settings
+
+    api_url, model = resolve_llm_settings()
     api_key = os.getenv("LLM_API_KEY") or os.getenv("DEEPSEEK_API_KEY", "")
-    model = os.getenv("LLM_MODEL", "deepseek-chat")
 
     if not api_key:
         raise RuntimeError("LLM_API_KEY 或 DEEPSEEK_API_KEY 未设置")

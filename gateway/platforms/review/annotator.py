@@ -5,11 +5,10 @@ from io import BytesIO
 from typing import List
 
 from docx import Document
-from docx.oxml.ns import qn, nsdecls
-from docx.oxml import parse_xml
+from docx.oxml.ns import qn
 from lxml import etree
 
-from .models import Annotation, Paragraph
+from .models import Annotation
 
 
 # ─── 高亮颜色映射 ───
@@ -29,7 +28,6 @@ SEVERITY_LABELS = {
 async def generate_annotated_docx(
     file_bytes: bytes,
     filename: str,
-    paragraphs: List[Paragraph],
     annotations: List[Annotation],
 ) -> bytes:
     """生成带批注和高亮的 Word 文档。
@@ -39,14 +37,13 @@ async def generate_annotated_docx(
     return await asyncio.get_event_loop().run_in_executor(
         None,
         _generate_sync,
-        file_bytes, filename, paragraphs, annotations,
+        file_bytes, filename, annotations,
     )
 
 
 def _generate_sync(
     file_bytes: bytes,
     filename: str,
-    paragraphs: List[Paragraph],
     annotations: List[Annotation],
 ) -> bytes:
     """同步生成批注文档"""
@@ -58,12 +55,13 @@ def _generate_sync(
         anno_map.setdefault(a.paragraph_index, []).append(a)
 
     # ── 第 1 步：逐段添加 Comment 和高亮 ──
-    for para in doc.paragraphs:
-        para_idx = _get_paragraph_index(para, paragraphs)
-        if para_idx not in anno_map:
+    # 解析器 index 即 document.paragraphs 的枚举序号（含空段，见 parser.py），
+    # 因此按文档位置锚定，避免文本匹配在重复段落时错位。
+    for doc_idx, para in enumerate(doc.paragraphs, start=1):
+        if doc_idx not in anno_map:
             continue
 
-        for anno in anno_map[para_idx]:
+        for anno in anno_map[doc_idx]:
             _add_comment(doc, para, anno)
             _highlight_paragraph(para, anno.severity)
 
@@ -153,55 +151,6 @@ def _highlight_paragraph(para, severity: str) -> None:
         highlight.set(qn("w:val"), color)
 
 
-def _add_summary_table(doc: Document, annotations: List[Annotation]) -> None:
-    """在文末添加审核汇总表"""
-    # 添加分页
-    doc.add_page_break()
-
-    # 标题
-    doc.add_heading("审核汇总表", level=1)
-
-    # 统计摘要
-    critical = sum(1 for a in annotations if a.severity == "critical")
-    important = sum(1 for a in annotations if a.severity == "important")
-    suggestion = sum(1 for a in annotations if a.severity == "suggestion")
-
-    summary = doc.add_paragraph()
-    run_c = summary.add_run(f"🔴 严重（必须修改）：{critical} 条    ")
-    run_c.bold = True
-    run_i = summary.add_run(f"🟡 重要（建议修改）：{important} 条    ")
-    run_i.bold = True
-    run_s = summary.add_run(f"🔵 建议（可选优化）：{suggestion} 条")
-    run_s.bold = True
-
-    # 表格
-    table = doc.add_table(rows=1, cols=6, style="Table Grid")
-    table.autofit = True
-
-    # 表头
-    headers = ["段落", "级别", "问题类型", "问题说明", "修改建议", "参考依据"]
-    for i, header in enumerate(headers):
-        cell = table.rows[0].cells[i]
-        cell.text = header
-        shading = parse_xml(
-            f'<w:shd {nsdecls("w")} w:fill="D9E2F3" w:val="clear"/>'
-        )
-        cell._element.get_or_add_tcPr().append(shading)
-        for paragraph in cell.paragraphs:
-            for run in paragraph.runs:
-                run.bold = True
-
-    # 数据行
-    for anno in annotations:
-        row = table.add_row()
-        row.cells[0].text = str(anno.paragraph_index)
-        row.cells[1].text = SEVERITY_LABELS.get(anno.severity, anno.severity)
-        row.cells[2].text = anno.issue_type
-        row.cells[3].text = anno.description
-        row.cells[4].text = anno.suggestion
-        row.cells[5].text = anno.reference
-
-
 def _ensure_comments_part(doc: Document):
     """确保 Word 文档中存在 comments 部件。
 
@@ -276,12 +225,3 @@ def _next_comment_id(comments_element) -> int:
         return 0
     max_id = max(int(c.get(qn("w:id"), "0")) for c in existing)
     return max_id + 1
-
-
-def _get_paragraph_index(para, paragraphs: List[Paragraph]) -> int:
-    """通过文本匹配找到段落在原始解析结果中的索引"""
-    para_text = para.text.strip()
-    for p in paragraphs:
-        if p.text.strip() == para_text:
-            return p.index
-    return 0

@@ -8,6 +8,15 @@ import re
 
 logger = logging.getLogger(__name__)
 
+# 仓库内置技能目录（checkout 部署场景开箱即用，无需手动部署技能）。
+# skill_loader.py 位于 gateway/platforms/review/，向上三级即仓库根。
+REPO_SKILL_DIR = (
+    Path(__file__).resolve().parents[3]
+    / "skills"
+    / "official-document-drafting"
+    / "document-review"
+)
+
 
 @dataclass
 class ReviewSkill:
@@ -27,9 +36,10 @@ class ReviewSkill:
 def load_review_skill() -> Optional[ReviewSkill]:
     """加载 document-review 技能。
 
-    查找顺序：
+    查找顺序（用户部署优先，仓库内置兜底）：
     1. $HERMES_HOME/skills/official-document-drafting/document-review/
     2. ~/.hermes/skills/official-document-drafting/document-review/
+    3. 仓库 skills/official-document-drafting/document-review/
     """
     try:
         from hermes_constants import get_hermes_home
@@ -82,10 +92,14 @@ def load_review_skill() -> Optional[ReviewSkill]:
 
 
 def _find_skill_dir(hermes_home: Path) -> Optional[Path]:
-    """查找 document-review 技能目录"""
+    """查找 document-review 技能目录。
+
+    优先级：用户部署（hermes home）> 仓库内置。
+    """
     candidates = [
         hermes_home / "skills" / "official-document-drafting" / "document-review",
         Path.home() / ".hermes" / "skills" / "official-document-drafting" / "document-review",
+        REPO_SKILL_DIR,
     ]
     for c in candidates:
         if (c / "SKILL.md").exists():

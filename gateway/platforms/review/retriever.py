@@ -117,9 +117,48 @@ def _deduplicate(results: List[dict]) -> List[dict]:
 
 
 async def _extract_full_text(results: List[dict]) -> List[dict]:
-    """提取全文。
+    """对每条结果调用 Tavily extract API 提取全文，写入 content 字段。
 
-    当前实现：直接使用 Tavily 返回的摘要。
-    如需全文，可调用 web_extract 工具或 aiohttp 抓取。
+    - 无 TAVILY_API_KEY 时跳过，保留 Tavily 摘要
+    - 提取失败或未返回全文时保留原摘要（不阻断审核流程）
+    - 全文截断到 5000 字符（技能规定提取上限）
     """
-    return results
+    api_key = os.getenv("TAVILY_API_KEY", "")
+    if not api_key or not results:
+        return results
+
+    urls = [r.get("url", "") for r in results if r.get("url")]
+    if not urls:
+        return results
+
+    extracted: Dict[str, str] = {}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.tavily.com/extract",
+                json={"api_key": api_key, "urls": urls},
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning("Tavily extract 返回 %d，保留摘要", resp.status)
+                    return results
+                data = await resp.json()
+                for item in data.get("results", []):
+                    raw = item.get("raw_content", "")
+                    if raw:
+                        extracted[item.get("url", "")] = raw
+    except Exception as e:
+        logger.warning("Tavily extract 异常: %s，保留摘要", e)
+        return results
+
+    if not extracted:
+        return results
+
+    enriched = []
+    for r in results:
+        full = extracted.get(r.get("url", ""), "")
+        if full:
+            r = dict(r)
+            r["content"] = full[:5000]
+        enriched.append(r)
+    return enriched

@@ -2550,6 +2550,11 @@ DEFAULT_CONFIG = {
         # the historical serve-all behavior; [] serves only the default.
         "multiplex_profile_allowlist": None,
 
+        # 文档审核端点（gateway/platforms/review/）的 LLM 行为设置不在此列默认值。
+        # 默认值驻留在 gateway/platforms/review/settings.py 的常量中；
+        # 用户可在 config.yaml 写 gateway.review.llm_url/llm_model 覆盖，
+        # 否则回退 env LLM_API_URL/LLM_MODEL。若在此放默认值，会遮蔽 env 回退。
+
         # Durable delivery-obligation ledger: final agent responses are
         # recorded in state.db around the platform send, and a gateway that
         # died between finalize and platform ACK redelivers the stored

@@ -16,6 +16,7 @@ from gateway.platforms.review.skill_loader import (
     load_review_skill,
     _find_skill_dir,
     _parse_search_config,
+    REPO_SKILL_DIR,
 )
 
 
@@ -62,8 +63,42 @@ class TestFindSkillDir:
 
     def test_skill_not_found(self):
         with tempfile.TemporaryDirectory() as tmp:
-            result = _find_skill_dir(Path(tmp))
-            assert result is None
+            with patch(
+                "gateway.platforms.review.skill_loader.REPO_SKILL_DIR",
+                Path(tmp) / "no-repo-skill",
+            ):
+                result = _find_skill_dir(Path(tmp))
+                assert result is None
+
+    def test_repo_skill_used_when_no_user_skill(self):
+        """hermes home 无技能时，回退仓库内置技能目录。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir = Path(tmp) / "repo-skill"
+            repo_dir.mkdir()
+            (repo_dir / "SKILL.md").write_text("# 仓库内置审核标准")
+
+            with patch(
+                "gateway.platforms.review.skill_loader.REPO_SKILL_DIR", repo_dir
+            ):
+                result = _find_skill_dir(Path(tmp))
+                assert result == repo_dir
+
+    def test_user_skill_takes_precedence_over_repo(self):
+        """用户部署的技能优先于仓库内置技能。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            user_dir = Path(tmp) / "skills" / "official-document-drafting" / "document-review"
+            user_dir.mkdir(parents=True)
+            (user_dir / "SKILL.md").write_text("# 用户覆盖版")
+
+            repo_dir = Path(tmp) / "repo-skill"
+            repo_dir.mkdir()
+            (repo_dir / "SKILL.md").write_text("# 仓库内置版")
+
+            with patch(
+                "gateway.platforms.review.skill_loader.REPO_SKILL_DIR", repo_dir
+            ):
+                result = _find_skill_dir(Path(tmp))
+                assert result == user_dir
 
 
 class TestParseSearchConfig:
@@ -137,19 +172,30 @@ class TestLoadReviewSkill:
 
     def test_load_skill_not_found(self):
         with tempfile.TemporaryDirectory() as tmp:
-            with patch("hermes_constants.get_hermes_home", return_value=Path(tmp)):
+            with patch("hermes_constants.get_hermes_home", return_value=Path(tmp)), patch(
+                "gateway.platforms.review.skill_loader.REPO_SKILL_DIR",
+                Path(tmp) / "no-repo-skill",
+            ):
                 skill = load_review_skill()
                 assert skill is None
 
-    def test_load_no_skill_md(self):
+    def test_load_no_skill_md_falls_back_to_repo(self):
+        """hermes home 目录不完整（缺 SKILL.md）时回退仓库内置技能。"""
         with tempfile.TemporaryDirectory() as tmp:
             skill_dir = Path(tmp) / "skills" / "official-document-drafting" / "document-review"
             skill_dir.mkdir(parents=True)
             # No SKILL.md
 
-            with patch("hermes_constants.get_hermes_home", return_value=Path(tmp)):
+            repo_dir = Path(tmp) / "repo-skill"
+            repo_dir.mkdir()
+            (repo_dir / "SKILL.md").write_text("# 仓库内置审核标准")
+
+            with patch("hermes_constants.get_hermes_home", return_value=Path(tmp)), patch(
+                "gateway.platforms.review.skill_loader.REPO_SKILL_DIR", repo_dir
+            ):
                 skill = load_review_skill()
-                assert skill is None
+                assert skill is not None
+                assert skill.skill_path == str(repo_dir)
 
     def test_load_defaults_when_no_search_config(self):
         with tempfile.TemporaryDirectory() as tmp:

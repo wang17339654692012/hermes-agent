@@ -11,10 +11,57 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from gateway.platforms.review.comparator import (
     compare_paragraphs,
     _build_reference_text,
+    _build_review_system_prompt,
+    _build_user_prompt,
     _parse_annotations,
 )
 from gateway.platforms.review.models import Annotation, Paragraph
 from gateway.platforms.review.skill_loader import ReviewSkill
+
+
+class TestBuildReviewSystemPrompt:
+    """_build_review_system_prompt tests — 审核范围 + 文种声明。"""
+
+    def test_includes_skill_standard(self):
+        skill = ReviewSkill(review_standard="三级审核标准全文")
+        prompt = _build_review_system_prompt(skill, doc_type=None)
+        assert "三级审核标准全文" in prompt
+
+    def test_includes_doc_type(self):
+        skill = ReviewSkill(review_standard="标准")
+        prompt = _build_review_system_prompt(skill, doc_type="通知")
+        assert "通知" in prompt
+
+    def test_without_doc_type_declares_unknown(self):
+        """未识别文种时显式声明，避免模型凭空假设文种。"""
+        skill = ReviewSkill(review_standard="标准")
+        prompt = _build_review_system_prompt(skill, doc_type=None)
+        assert "文种" in prompt
+
+    def test_covers_language_and_policy_review(self):
+        """审核范围必须同时覆盖政策对比与语言/格式审核（需求 3.3）。"""
+        skill = ReviewSkill(review_standard="标准")
+        prompt = _build_review_system_prompt(skill, doc_type="报告")
+        assert "语言" in prompt or "格式" in prompt
+        assert "参考材料" in prompt
+
+
+class TestBuildUserPrompt:
+    """_build_user_prompt tests — 空检索时的防编造显式指令。"""
+
+    def test_empty_refs_injects_instruction(self):
+        """检索无结果时显式注入防编造指令，不依赖模型自觉。"""
+        prompt = _build_user_prompt(reference_text="", paragraphs_text="[段落 1] 内容")
+        assert "未检索到" in prompt
+        assert "人工核实" in prompt
+
+    def test_with_refs_shows_material(self):
+        prompt = _build_user_prompt(
+            reference_text="【参考 1】来源：http://a.com",
+            paragraphs_text="[段落 1] 内容",
+        )
+        assert "http://a.com" in prompt
+        assert "未检索到" not in prompt
 
 
 class TestBuildReferenceText:
@@ -183,3 +230,40 @@ class TestCompareParagraphs:
             batch_size=5,  # 4 batches
         )
         assert mock_llm.call_count == 4  # 19/5 = 4 batches
+
+    @patch("gateway.platforms.review.comparator._call_llm_with_system")
+    @pytest.mark.asyncio
+    async def test_doc_type_passed_into_system_prompt(self, mock_llm):
+        """doc_type 必须注入审核 prompt，模型才能按文种聚焦格式标准。"""
+        mock_llm.return_value = "[]"
+
+        skill = ReviewSkill(review_standard="标准", extract_chars=5000)
+        paragraphs = [Paragraph(index=1, text="内容")]
+
+        await compare_paragraphs(
+            paragraphs=paragraphs,
+            refs=[],
+            skill=skill,
+            doc_type="通知",
+        )
+
+        system_prompt = mock_llm.call_args.kwargs["system_prompt"]
+        assert "通知" in system_prompt
+
+    @patch("gateway.platforms.review.comparator._call_llm_with_system")
+    @pytest.mark.asyncio
+    async def test_empty_refs_user_prompt_instruction(self, mock_llm):
+        """检索结果为空时，user prompt 携带防编造显式指令。"""
+        mock_llm.return_value = "[]"
+
+        skill = ReviewSkill(review_standard="标准", extract_chars=5000)
+        paragraphs = [Paragraph(index=1, text="内容")]
+
+        await compare_paragraphs(
+            paragraphs=paragraphs,
+            refs=[],
+            skill=skill,
+        )
+
+        user_prompt = mock_llm.call_args.kwargs["user_prompt"]
+        assert "未检索到" in user_prompt

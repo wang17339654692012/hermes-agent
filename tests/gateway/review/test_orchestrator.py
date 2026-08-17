@@ -95,6 +95,46 @@ class TestReviewOrchestratorFormat:
         assert text == ""
 
 
+class TestAnalyzeContentDocType:
+    """_analyze_content 文种识别 tests — 需求：传参跳过识别，否则自动识别。"""
+
+    @patch("gateway.platforms.review.orchestrator._call_llm")
+    @pytest.mark.asyncio
+    async def test_known_doc_type_overrides_llm(self, mock_llm):
+        """调用方传了 doc_type 时，以传入值为准（跳过自动识别）。"""
+        from gateway.platforms.review.skill_loader import ReviewSkill
+
+        mock_llm.return_value = (
+            '{"themes": ["党建"], "expressions": [], "references": [], "doc_type": "报告"}'
+        )
+        orch = ReviewOrchestrator(
+            file_bytes=b"test", filename="test.docx", doc_type="通知",
+        )
+        skill = ReviewSkill(review_standard="标准")
+
+        analysis = await orch._analyze_content(
+            [Paragraph(index=1, text="内容")], skill, known_doc_type="通知",
+        )
+        assert analysis["doc_type"] == "通知"
+
+    @patch("gateway.platforms.review.orchestrator._call_llm")
+    @pytest.mark.asyncio
+    async def test_llm_detected_doc_type_kept(self, mock_llm):
+        """未传 doc_type 时，保留 LLM 自动识别的结果。"""
+        from gateway.platforms.review.skill_loader import ReviewSkill
+
+        mock_llm.return_value = (
+            '{"themes": ["考核"], "expressions": [], "references": [], "doc_type": "报告"}'
+        )
+        orch = ReviewOrchestrator(file_bytes=b"test", filename="test.docx")
+        skill = ReviewSkill(review_standard="标准")
+
+        analysis = await orch._analyze_content(
+            [Paragraph(index=1, text="内容")], skill, known_doc_type=None,
+        )
+        assert analysis["doc_type"] == "报告"
+
+
 class TestReviewOrchestratorRun:
     """ReviewOrchestrator.run integration tests."""
 
@@ -292,3 +332,99 @@ class TestReviewOrchestratorRun:
         assert "warning" in result
         assert "download_url" not in result
         assert "issues" in result
+
+    @patch("gateway.platforms.review.orchestrator.load_review_skill")
+    @patch("gateway.platforms.review.orchestrator.parse_document")
+    @patch("gateway.platforms.review.orchestrator._call_llm")
+    @patch("gateway.platforms.review.orchestrator.multi_round_search")
+    @patch("gateway.platforms.review.orchestrator.compare_paragraphs")
+    @patch("gateway.platforms.review.orchestrator.generate_annotated_docx")
+    @pytest.mark.asyncio
+    async def test_run_pdf_annotate_true_warns_and_skips(
+        self, mock_annotate, mock_compare, mock_search, mock_llm, mock_parse, mock_load
+    ):
+        """PDF + annotate=true：显式 warning，跳过批注生成（不靠异常降级）。"""
+        from gateway.platforms.review.skill_loader import ReviewSkill
+
+        mock_load.return_value = ReviewSkill(
+            review_standard="标准",
+            search_platforms=[{"name": "党建网", "domain": "dangjian.cn"}],
+        )
+        mock_parse.return_value = [Paragraph(index=1, text="测试")]
+        mock_llm.return_value = '{"themes": ["党建"], "expressions": [], "references": []}'
+        mock_search.return_value = []
+        mock_compare.return_value = []
+
+        orch = ReviewOrchestrator(
+            file_bytes=b"%PDF-1.4", filename="test.pdf", annotate=True,
+        )
+        result = await orch.run()
+
+        assert "error" not in result
+        assert "warning" in result
+        assert "PDF" in result["warning"]
+        assert "download_url" not in result
+        mock_annotate.assert_not_called()
+
+    @patch("gateway.platforms.review.orchestrator.load_review_skill")
+    @patch("gateway.platforms.review.orchestrator.parse_document")
+    @patch("gateway.platforms.review.orchestrator._call_llm")
+    @patch("gateway.platforms.review.orchestrator.multi_round_search")
+    @patch("gateway.platforms.review.orchestrator.compare_paragraphs")
+    @pytest.mark.asyncio
+    async def test_run_passes_known_doc_type_to_compare(
+        self, mock_compare, mock_search, mock_llm, mock_parse, mock_load
+    ):
+        """run() 将调用方传入的 doc_type 透传给逐段审核。"""
+        from gateway.platforms.review.skill_loader import ReviewSkill
+
+        mock_load.return_value = ReviewSkill(
+            review_standard="标准",
+            search_platforms=[{"name": "党建网", "domain": "dangjian.cn"}],
+        )
+        mock_parse.return_value = [Paragraph(index=1, text="测试")]
+        mock_llm.return_value = (
+            '{"themes": ["党建"], "expressions": [], "references": [], "doc_type": "报告"}'
+        )
+        mock_search.return_value = []
+        mock_compare.return_value = []
+
+        orch = ReviewOrchestrator(
+            file_bytes=b"test", filename="test.docx",
+            doc_type="通知", annotate=False,
+        )
+        await orch.run()
+
+        kwargs = mock_compare.call_args.kwargs
+        assert kwargs["doc_type"] == "通知"
+
+    @patch("gateway.platforms.review.orchestrator.load_review_skill")
+    @patch("gateway.platforms.review.orchestrator.parse_document")
+    @patch("gateway.platforms.review.orchestrator._call_llm")
+    @patch("gateway.platforms.review.orchestrator.multi_round_search")
+    @patch("gateway.platforms.review.orchestrator.compare_paragraphs")
+    @pytest.mark.asyncio
+    async def test_run_passes_llm_detected_doc_type_to_compare(
+        self, mock_compare, mock_search, mock_llm, mock_parse, mock_load
+    ):
+        """未传 doc_type 时，run() 将 LLM 自动识别的文种透传给逐段审核。"""
+        from gateway.platforms.review.skill_loader import ReviewSkill
+
+        mock_load.return_value = ReviewSkill(
+            review_standard="标准",
+            search_platforms=[{"name": "党建网", "domain": "dangjian.cn"}],
+        )
+        mock_parse.return_value = [Paragraph(index=1, text="测试")]
+        mock_llm.return_value = (
+            '{"themes": ["党建"], "expressions": [], "references": [], "doc_type": "报告"}'
+        )
+        mock_search.return_value = []
+        mock_compare.return_value = []
+
+        orch = ReviewOrchestrator(
+            file_bytes=b"test", filename="test.docx", annotate=False,
+        )
+        await orch.run()
+
+        kwargs = mock_compare.call_args.kwargs
+        assert kwargs["doc_type"] == "报告"
