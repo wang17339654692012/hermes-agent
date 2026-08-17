@@ -238,6 +238,11 @@ vision = []
 # any existing requests for the `pty` extra resolve cleanly
 # without pulling in extra packages.
 pty = []
+# 文档审核端点（gateway/platforms/review/）——.docx 解析与 Word 批注生成。
+# 内置端点功能，非 opt-in 第三方后端，随 [all] 预装（客户服务器离线部署
+# 时无 lazy-install 网络条件）。python-docx/lxml 为纯 Python 或预编译轮子，
+# pymupdf 官方提供 Linux/Windows/macOS 轮子，均无源码构建路径。
+review = ["python-docx==1.2.0", "pymupdf==1.28.0", "lxml==6.1.1", "minio==7.2.20"]
 # CVE-2026-48710 (BadHost): Starlette is pulled transitively by mcp's
 # sse-starlette / HTTP-SSE stack (and by fastapi in the `web` extra). Before
 # 1.0.1, a malformed Host header makes `request.url.path` desync from the path
@@ -348,6 +353,7 @@ all = [
   # where the user is expected to have a toolchain available.
   "hermes-agent[cron]",
   "hermes-agent[pty]",
+  "hermes-agent[review]",
   "hermes-agent[mcp]",
   "hermes-agent[homeassistant]",
   "hermes-agent[sms]",

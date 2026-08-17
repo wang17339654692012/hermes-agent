@@ -55,6 +55,10 @@ htmlcov/
 # Documentation
 *.md
 
+# Bundled skills ship SKILL.md / references/*.md that the runtime loads
+# at container start (skills_sync.py) — keep those markdown files in.
+!skills/**
+
 # Runtime data (bind-mounted at /opt/data; must not leak into build context)
 data/
 .hermes-docker/

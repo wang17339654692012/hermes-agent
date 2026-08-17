@@ -5,7 +5,12 @@
 FROM debian:13.4 AS sqlite_build
 ARG SQLITE_AUTOCONF_VERSION=3530400
 ARG SQLITE_SHA256=0e9483900e92cd5de8fd48d16bf9200145a61f7fd5be542a5ac81d8a9516eb9c
-RUN apt-get -o Acquire::Retries=3 update && \
+# 国内网络构建时可用 --build-arg APT_MIRROR=mirrors.aliyun.com 切换到镜像源（默认官方源）
+ARG APT_MIRROR=""
+RUN if [ -n "$APT_MIRROR" ]; then \
+        sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
+    fi && \
+    apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
         build-essential ca-certificates curl && \
     rm -rf /var/lib/apt/lists/* && \
@@ -51,6 +56,9 @@ FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df228
 FROM node:26-bookworm-slim@sha256:9e6f9357d371591e32ab6f2d8a26d63bdd0d17c29eee3f4f3e7e454d9634bf73 AS node_source
 FROM debian:13.4
 
+# 国内网络构建时可用 --build-arg APT_MIRROR=mirrors.aliyun.com 切换到镜像源（默认官方源）
+ARG APT_MIRROR=""
+
 # Disable Python stdout buffering to ensure logs are printed immediately.
 # Do not write .pyc files at runtime: /opt/hermes is immutable in the
 # published container and writable state belongs under /opt/data.
@@ -68,7 +76,10 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 # replaces tini with s6-overlay's /init (PID 1 = s6-svscan), which reaps
 # zombies non-blockingly on SIGCHLD and additionally supervises the main
 # hermes process, the dashboard, and per-profile gateways.
-RUN apt-get -o Acquire::Retries=3 update && \
+RUN if [ -n "$APT_MIRROR" ]; then \
+        sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
+    fi && \
+    apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils && \
     rm -rf /var/lib/apt/lists/*
@@ -110,13 +121,16 @@ ARG S6_OVERLAY_NOARCH_SHA256=b720f9d9340efc8bb07528b9743813c836e4b02f8693d90241f
 ARG S6_OVERLAY_X86_64_SHA256=a93f02882c6ed46b21e7adb5c0add86154f01236c93cd82c7d682722e8840563
 ARG S6_OVERLAY_AARCH64_SHA256=0952056ff913482163cc30e35b2e944b507ba1025d78f5becbb89367bf344581
 ARG S6_OVERLAY_SYMLINKS_SHA256=a60dc5235de3ecbcf874b9c1f18d73263ab99b289b9329aa950e8729c4789f0e
+# 国内网络构建时可传 --build-arg S6_OVERLAY_BASE_URL=https://ghproxy.net/https://github.com/just-containers/s6-overlay/releases/download
+# （github.com 直连不稳定；下载内容仍由下方 SHA256 校验，镜像源不破坏完整性）
+ARG S6_OVERLAY_BASE_URL="https://github.com/just-containers/s6-overlay/releases/download"
 RUN set -eu; \
     case "${TARGETARCH:-amd64}" in \
         amd64) s6_arch="x86_64"; s6_arch_sha="${S6_OVERLAY_X86_64_SHA256}" ;; \
         arm64) s6_arch="aarch64"; s6_arch_sha="${S6_OVERLAY_AARCH64_SHA256}" ;; \
         *) echo "Unsupported TARGETARCH=${TARGETARCH} for s6-overlay" >&2; exit 1 ;; \
     esac; \
-    base="https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}"; \
+    base="${S6_OVERLAY_BASE_URL}/v${S6_OVERLAY_VERSION}"; \
     curl -fsSL --retry 3 -o /tmp/s6-overlay-noarch.tar.xz \
         "${base}/s6-overlay-noarch.tar.xz"; \
     curl -fsSL --retry 3 -o /tmp/s6-overlay-symlinks-noarch.tar.xz \
@@ -196,7 +210,14 @@ COPY apps/shared/ apps/shared/
 # guards against a future regression if the source npm version changes.
 ENV npm_config_install_links=false
 
-RUN npm install --prefer-offline --no-audit --fetch-retries=5 && \
+# 国内网络构建时可传 --build-arg PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright
+# （chromium 默认从微软 CDN 下载，国内不稳定）
+ARG PLAYWRIGHT_DOWNLOAD_HOST=""
+
+RUN if [ -n "$PLAYWRIGHT_DOWNLOAD_HOST" ]; then \
+        export PLAYWRIGHT_DOWNLOAD_HOST="${PLAYWRIGHT_DOWNLOAD_HOST}"; \
+    fi; \
+    npm install --prefer-offline --no-audit --fetch-retries=5 && \
     for i in 1 2 3; do \
         npx playwright install --with-deps chromium --only-shell && break || \
         { [ "$i" = 3 ] && exit 1; echo "playwright install failed (attempt $i); retrying in 10s"; sleep 10; }; \
