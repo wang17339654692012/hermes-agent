@@ -1,0 +1,90 @@
+# 公文审核智能体 — 生产部署编排
+#
+# 服务：gateway（审核 API + 网关）、minio（批注文档存储）、minio-init（一次性建桶）
+# 前置：镜像已 docker load（见 README.md）；.env 已按 .env.example 填写
+# 启动：docker compose up -d
+# 验证：docker compose ps（三个服务就绪）→ bash tests/test_review_api.sh
+
+name: review-agent
+
+services:
+  gateway:
+    image: ${HERMES_IMAGE:-hermes-agent:review}
+    container_name: review-gateway
+    restart: unless-stopped
+    command: ["gateway", "run"]
+    ports:
+      - "${HOST_API_PORT:-8642}:8642"
+    volumes:
+      # 持久化：首启 seed 的 .env/config.yaml、skills 同步、sessions、logs
+      - ./data:/opt/data
+    environment:
+      - HERMES_UID=10000
+      - HERMES_GID=10000
+      # api_server 启用三要素：KEY 必须 ≥16 字符强密钥（短密钥平台不启用）
+      - API_SERVER_ENABLED=true
+      - API_SERVER_HOST=0.0.0.0
+      - API_SERVER_KEY=${API_SERVER_KEY:?API_SERVER_KEY 未设置，且必须≥16字符}
+      # LLM（默认火山引擎；行为设置，可参数化）
+      - LLM_API_KEY=${LLM_API_KEY:?LLM_API_KEY 未设置}
+      - LLM_API_URL=${LLM_API_URL:-https://ark.cn-beijing.volces.com/api/v3/chat/completions}
+      - LLM_MODEL=${LLM_MODEL:-deepseek-v3-250324}
+      # 权威检索（可选；留空则降级为纯 LLM 审核，不阻断）
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
+      # MinIO（服务名可达；presigned URL 外部可达性靠 MINIO_PUBLIC_ENDPOINT）
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:-minioadmin}
+      - MINIO_BUCKET=${MINIO_BUCKET:-hermes-files}
+      - MINIO_SECURE=false
+      - MINIO_PUBLIC_ENDPOINT=${MINIO_PUBLIC_ENDPOINT:-}
+    depends_on:
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8642/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  minio:
+    image: ${MINIO_IMAGE:-minio/minio:latest}
+    container_name: review-minio
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  minio-init:
+    image: ${MC_IMAGE:-minio/mc:latest}
+    container_name: review-minio-init
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}" && \
+        mc mb --ignore-existing "local/$${MINIO_BUCKET}" && \
+        echo "[minio-init] bucket $${MINIO_BUCKET} ready"
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
+      - MINIO_BUCKET=${MINIO_BUCKET:-hermes-files}
+    depends_on:
+      minio:
+        condition: service_healthy
+
+volumes:
+  minio_data:
