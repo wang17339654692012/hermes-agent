@@ -270,3 +270,49 @@ class TestMultiRoundSearch:
         )
         # Should be deduplicated
         assert len(results) == 2
+
+    @patch("gateway.platforms.review.retriever._tavily_search")
+    @pytest.mark.asyncio
+    async def test_queries_run_concurrently_but_bounded(self, mock_search):
+        """查询之间无数据依赖：并发执行；信号量将并发上限限制在 4。"""
+        import asyncio
+
+        from gateway.platforms.review.retriever import MAX_CONCURRENT_SEARCHES
+
+        entries = 0
+        reached_cap = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_search(query, domains):
+            nonlocal entries
+            entries += 1
+            if entries == MAX_CONCURRENT_SEARCHES:
+                reached_cap.set()
+            await release.wait()
+            return []
+
+        mock_search.side_effect = slow_search
+
+        analysis = {"themes": ["a", "b", "c"], "expressions": [], "references": []}
+        platforms = [
+            {"name": "p1", "domain": "d1.cn"},
+            {"name": "p2", "domain": "d2.cn"},
+        ]
+
+        task = asyncio.create_task(
+            multi_round_search(
+                analysis=analysis,
+                platforms=platforms,
+                domains=["d1.cn"],
+                rounds=1,
+            )
+        )
+        # 等信号量被占满（4 个查询并发执行中）
+        await asyncio.wait_for(reached_cap.wait(), timeout=5)
+        assert entries == MAX_CONCURRENT_SEARCHES  # 并发被信号量封顶
+        # 未被占满前，第 5 个查询不得进入（信号量阻塞）
+        await asyncio.sleep(0.05)
+        assert entries == MAX_CONCURRENT_SEARCHES
+        release.set()
+        await task
+        assert mock_search.call_count == 6  # 3 themes × 2 platforms

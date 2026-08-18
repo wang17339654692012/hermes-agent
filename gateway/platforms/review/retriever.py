@@ -9,6 +9,9 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
+# Tavily 免费套餐有 RPM 限制，并发查询需限流
+MAX_CONCURRENT_SEARCHES = 4
+
 
 async def multi_round_search(
     analysis: dict,
@@ -19,6 +22,8 @@ async def multi_round_search(
     """技能驱动的多轮递进式检索。
 
     策略完全由技能文件（party-building-search.md）定义，代码只执行。
+    查询之间无数据依赖，全部收集后并发执行（信号量限流，
+    避免触发 Tavily RPM 限制）。
 
     Args:
         analysis: LLM 分析的文档内容 {themes, expressions, references}
@@ -29,36 +34,43 @@ async def multi_round_search(
     Returns:
         去重排序后的检索结果列表（含全文）
     """
-    all_results: List[dict] = []
+    # ── 收集所有查询（第 1 轮：宽泛；第 2 轮：精准；第 3 轮：深挖疑点）──
+    queries: List[str] = []
 
-    # ── 第 1 轮：宽泛检索 ──
+    # 第 1 轮：宽泛检索
     for theme in analysis.get("themes", [])[:3]:
         for p in platforms:
-            query = f"site:{p['domain']} {theme}"
-            results = await _tavily_search(query, domains)
-            all_results.extend(results)
+            queries.append(f"site:{p['domain']} {theme}")
 
-    # ── 第 2 轮：精准检索 ──
+    # 第 2 轮：精准检索
     if rounds >= 2:
         for ref in analysis.get("references", [])[:5]:
             text = ref.get("text", "")
             if not text:
                 continue
             for p in platforms:
-                query = f"site:{p['domain']} {text}"
-                results = await _tavily_search(query, domains)
-                all_results.extend(results)
+                queries.append(f"site:{p['domain']} {text}")
 
-    # ── 第 3 轮：深挖疑点 ──
+    # 第 3 轮：深挖疑点
     if rounds >= 3:
         for expr in analysis.get("expressions", [])[:5]:
             text = expr.get("text", "")
             if not text:
                 continue
             for p in platforms:
-                query = f"site:{p['domain']} {text} 最新"
-                results = await _tavily_search(query, domains)
-                all_results.extend(results)
+                queries.append(f"site:{p['domain']} {text} 最新")
+
+    # ── 并发执行（信号量限流，避免触发 Tavily RPM 限制）──
+    sem = asyncio.Semaphore(MAX_CONCURRENT_SEARCHES)
+
+    async def bounded(query: str) -> List[dict]:
+        async with sem:
+            return await _tavily_search(query, domains)
+
+    results_by_query = await asyncio.gather(*(bounded(q) for q in queries))
+    all_results: List[dict] = [
+        r for batch in results_by_query for r in batch
+    ]
 
     # 去重 + 排序
     unique = _deduplicate(all_results)
