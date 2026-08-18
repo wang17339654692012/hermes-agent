@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from gateway.platforms.review.orchestrator import (
     ReviewOrchestrator,
     Annotation,
+    _apply_region_policy,
     _parse_json_response,
 )
 from gateway.platforms.review.models import Paragraph
@@ -137,6 +138,15 @@ class TestAnalyzeContentDocType:
 
 class TestReviewOrchestratorRun:
     """ReviewOrchestrator.run integration tests."""
+
+    @pytest.fixture(autouse=True)
+    def _no_format_checks(self, monkeypatch):
+        """run 测试聚焦管线接线，屏蔽确定性格式检查（格式层单独测试）。"""
+        from gateway.platforms.review import format_checker
+
+        monkeypatch.setattr(
+            format_checker, "check", lambda *a, **k: []
+        )
 
     @patch("gateway.platforms.review.orchestrator.load_review_skill")
     @pytest.mark.asyncio
@@ -428,3 +438,193 @@ class TestReviewOrchestratorRun:
 
         kwargs = mock_compare.call_args.kwargs
         assert kwargs["doc_type"] == "报告"
+
+
+def _pars(*texts: str) -> list:
+    return [Paragraph(index=i + 1, text=t) for i, t in enumerate(texts) if t]
+
+
+_JOBBAO_DOC = [
+    "济南能源集团有限公司",
+    "作业活动梳理及“作业宝”APP建设",
+    "专题培训",
+    "（代通知）",
+    "一、培训时间和地点",
+    "时间：2026年6月17日至18日（共2天）",
+    "二、培训对象",
+    "集团公司及权属企业M8及以上职级管理人员",
+    "附件：",
+    "1.日程安排表",
+    "济南能源集团有限公司",
+    "2026年6月15日",
+    "附件1",
+    "日程安排表",
+]
+
+
+class TestRegionPolicy:
+    """_apply_region_policy — 用户决策落地的确定性过滤。"""
+
+    def _paras_with_regions(self):
+        from gateway.platforms.review.docmodel import build_document
+
+        paras = _pars(*_JOBBAO_DOC)
+        build_document(paras)
+        return paras
+
+    def _mk(self, index, issue_type, description, reference, severity="important"):
+        return Annotation(
+            paragraph_index=index, severity=severity, issue_type=issue_type,
+            description=description, suggestion="s", reference=reference,
+        )
+
+    def test_title_block_format_claim_dropped(self):
+        paras = self._paras_with_regions()
+        annos = [self._mk(1, "政治表述", "标题只有机关名称，缺少事由和文种", "r")]
+        assert _apply_region_policy(annos, paras) == []
+
+    def test_title_block_typo_kept(self):
+        paras = self._paras_with_regions()
+        annos = [self._mk(1, "错别字", "机关名称漏字，应为完整名称", "r")]
+        kept = _apply_region_policy(annos, paras)
+        assert len(kept) == 1
+
+    def test_attachment_page_claim_dropped(self):
+        paras = self._paras_with_regions()
+        annos = [self._mk(13, "用词规范性", "附件1 名称过于简略", "r")]
+        assert _apply_region_policy(annos, paras) == []
+
+    def test_signature_date_hallucination_dropped(self):
+        """成文日期段（SIGNATURE 区）的日期类批注一律撤销。"""
+        paras = self._paras_with_regions()
+        annos = [self._mk(12, "政治表述", "成文日期与当前日期矛盾，日期数字间有空格", "r")]
+        assert _apply_region_policy(annos, paras) == []
+
+    def test_structural_opinion_dropped(self):
+        paras = self._paras_with_regions()
+        annos = [self._mk(5, "结构不合理", "缺少通知缘由部分", "r")]
+        assert _apply_region_policy(annos, paras) == []
+
+    def test_unverified_subjective_dropped(self):
+        paras = self._paras_with_regions()
+        annos = [self._mk(8, "用词规范性", "M8 表述不规范", "未在权威来源中检索到对应表述，请人工核实")]
+        assert _apply_region_policy(annos, paras) == []
+
+    def test_unverified_factual_kept(self):
+        """事实类（错别字/漏字）即使无权威依据也保留。"""
+        paras = self._paras_with_regions()
+        annos = [self._mk(6, "错别字", "综合办公室箱漏字，应为邮箱", "未在权威来源中检索到对应表述")]
+        kept = _apply_region_policy(annos, paras)
+        assert len(kept) == 1
+
+    def test_title_block_claim_with_yingwei_not_exempted(self):
+        """标题区"缺文种"批注描述含"应为"（建议措辞）不豁免 → 删除。"""
+        paras = self._paras_with_regions()
+        annos = [
+            self._mk(1, "标题不完整", "标题缺少文种要素。标题应为“济南能源集团有限公司关于开展…的通知”。", "r", severity="critical")
+        ]
+        assert _apply_region_policy(annos, paras) == []
+
+    def test_date_claim_in_body_dropped(self):
+        """正文区的日期类批注（含培训时间/成文日期）一律撤销。"""
+        paras = self._paras_with_regions()
+        annos = [
+            self._mk(6, "日期错误", "培训时间为2026年6月17日至18日，但成文日期早于该时间。", "r", severity="critical")
+        ]
+        assert _apply_region_policy(annos, paras) == []
+
+    def test_inference_claim_dropped(self):
+        """推断式结论（"根据…推断"）无客观依据 → 删除（含 SIGNATURE 区错别字类）。"""
+        paras = self._paras_with_regions()
+        annos = [
+            self._mk(
+                12, "错别字",
+                "成文日期中的年份存在笔误。根据公文内容推断，该通知涉及的培训规划依据为《规划（2024—2028年）》。",
+                "r", severity="critical",
+            )
+        ]
+        assert _apply_region_policy(annos, paras) == []
+
+    def test_last_item_claim_on_non_last_dropped(self):
+        """"段末分号应改句号"断言：段后仍有内容时分号是正确的非末项分隔 → 删除。"""
+        paras = self._paras_with_regions()
+        annos = [
+            self._mk(6, "标点符号使用不当", "段落末尾使用分号，但该句为通知事项的完整陈述句，应使用句号。", "r")
+        ]
+        assert _apply_region_policy(annos, paras) == []
+
+    def test_last_item_claim_variant_mo_xiang_dropped(self):
+        """"末项"措辞变体（LLM 换词规避）：段后仍有内容 → 删除。"""
+        paras = self._paras_with_regions()
+        annos = [
+            self._mk(6, "标点符号使用不当", "段落末尾使用分号，但该句为通知事项的末项，此处应使用句号。", "r")
+        ]
+        assert _apply_region_policy(annos, paras) == []
+
+    def test_last_item_claim_on_actual_last_kept(self):
+        """最后一段上的"最后一项"断言属实 → 保留。"""
+        from gateway.platforms.review.docmodel import build_document
+
+        paras = _pars("一、培训时间和地点", "（六）各参训人员须按时到场；")
+        build_document(paras)
+        annos = [self._mk(2, "标点符号使用不当", "该句为通知事项最后一条，段末分号应使用句号。", "r")]
+        kept = _apply_region_policy(annos, paras)
+        assert len(kept) == 1
+
+    def test_body_annotation_kept(self):
+        paras = self._paras_with_regions()
+        annos = [self._mk(6, "标点符号", "逗号使用不当", "参考材料")]
+        kept = _apply_region_policy(annos, paras)
+        assert len(kept) == 1
+
+
+class TestRunMergesFormatAndContent:
+    """run() 合并确定性格式批注 + LLM 内容批注（真实 format_checker）。"""
+
+    @patch("gateway.platforms.review.orchestrator.load_review_skill")
+    @patch("gateway.platforms.review.orchestrator.parse_document")
+    @patch("gateway.platforms.review.orchestrator._call_llm")
+    @patch("gateway.platforms.review.orchestrator.multi_round_search")
+    @patch("gateway.platforms.review.orchestrator.compare_paragraphs")
+    @pytest.mark.asyncio
+    async def test_format_and_content_merged_with_policy(
+        self, mock_compare, mock_search, mock_llm, mock_parse, mock_load
+    ):
+        from gateway.platforms.review.skill_loader import ReviewSkill
+
+        mock_load.return_value = ReviewSkill(
+            review_standard="标准",
+            search_platforms=[{"name": "党建网", "domain": "dangjian.cn"}],
+        )
+        mock_parse.return_value = _pars(*_JOBBAO_DOC)
+        mock_llm.return_value = '{"themes": ["党建"], "expressions": [], "references": []}'
+        mock_search.return_value = []
+        mock_compare.return_value = [
+            Annotation(
+                paragraph_index=1, severity="critical",
+                issue_type="政治表述", description="标题只有机关名称", suggestion="s", reference="r",
+            ),  # 标题块 → 策略撤销
+            Annotation(
+                paragraph_index=8, severity="important",
+                issue_type="用词规范性", description="M8 不规范", suggestion="s",
+                reference="未在权威来源中检索到对应表述",
+            ),  # 无依据主观 → 删除
+            Annotation(
+                paragraph_index=6, severity="critical",
+                issue_type="错别字", description="综合办公室箱漏字", suggestion="s", reference="r",
+            ),  # 事实类 → 保留
+        ]
+
+        orch = ReviewOrchestrator(
+            file_bytes=b"test", filename="test.docx", annotate=False,
+        )
+        result = await orch.run()
+
+        assert "error" not in result
+        types = {i["type"] for i in result["issues"]}
+        # 确定性格式：主送机关缺失（作业宝文档真实存在）
+        assert "主送机关缺失" in types
+        # LLM 内容：错别字保留；标题块政治表述、无依据主观被过滤
+        assert "错别字" in types
+        assert "政治表述" not in types
+        assert "用词规范性" not in types

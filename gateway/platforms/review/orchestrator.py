@@ -1,6 +1,7 @@
 """审核流程编排器 — 代码只做管道，技能提供标准和策略。"""
 
 import asyncio
+import datetime
 import json
 import logging
 import os
@@ -13,6 +14,8 @@ from typing import List, Optional
 
 import aiohttp
 
+from . import format_checker
+from .docmodel import REGION_ATTACHMENT_LIST, REGION_ATTACHMENT_PAGES, REGION_SIGNATURE, REGION_TITLE_BLOCK
 from .skill_loader import load_review_skill, ReviewSkill
 from .models import Annotation, Paragraph
 from .parser import parse_document
@@ -21,6 +24,67 @@ from .comparator import compare_paragraphs
 from .annotator import generate_annotated_docx
 
 logger = logging.getLogger(__name__)
+
+# ── 区域策略：LLM 内容批注的确定性过滤 ──
+# 用户决策：无权威依据的主观措辞建议直接删除；"通知缘由缺失"类结构意见不报；
+# 标题块/落款/附件页只接受明确的文本错误类意见；日期类意见一律撤销
+# （日期一致性由 format_checker 确定性检查，LLM 报告即冗余）。
+
+# 明确的文本错误类型（错别字/漏字/…）——区域唯一放行类别（只看 issue_type，
+# 不信任描述里的"应为/应写"，那是建议措辞而非错误标记）
+_CN_TYPO_TYPE = re.compile(r"(错别字|漏字|错字|多字|缺字|笔误)")
+# 结构意见（缺通知缘由/层次/衔接/过渡）——不报
+_STRUCTURAL_OPINION = re.compile(r"(结构|层次|缘由|衔接|过渡)")
+# 日期类意见（LLM 报告日期/成文日期/培训时间问题均为冗余或幻觉）——撤销
+_DATE_CLAIM = re.compile(r"(日期|成文日期|培训时间|当前日期)")
+# 无权威检索依据
+_UNVERIFIED = re.compile(r"(未在权威来源中检索到|未检索到|无权威依据)")
+# 事实类（有权威依据或客观事实，不受"未检索到"删除规则影响）
+_FACTUAL = re.compile(r"(错别字|漏字|错字|多字|笔误|政治|引用|数据)")
+# 推断式结论（无客观依据的推测，如"根据公文内容推断"）
+_INFERENCE = re.compile(r"(推断|推测|猜测)")
+
+# 区域由系统确定性审核，LLM 仅可报文本错误
+_NON_REVIEW_REGIONS = {REGION_TITLE_BLOCK, REGION_SIGNATURE, REGION_ATTACHMENT_PAGES}
+
+
+def _apply_region_policy(
+    annotations: List[Annotation],
+    paragraphs: List[Paragraph],
+) -> List[Annotation]:
+    """对 LLM 内容批注执行区域策略（只作用于 content_annotations）。"""
+    by_index = {p.index: p for p in paragraphs}
+    nonempty_indices = sorted(p.index for p in paragraphs if p.text.strip())
+    kept: List[Annotation] = []
+    for a in annotations:
+        p = by_index.get(a.paragraph_index)
+        region = p.region if p is not None else ""
+
+        # 1. 标题块 / 落款 / 附件页：格式要素由系统确定性检查，仅放行文本错误类
+        if region in _NON_REVIEW_REGIONS and not _CN_TYPO_TYPE.search(a.issue_type):
+            continue
+        # 2. 结构意见（缺通知缘由等）不报
+        if _STRUCTURAL_OPINION.search(a.issue_type):
+            continue
+        # 3. 日期类意见撤销（格式检查已确定性处理）
+        if _DATE_CLAIM.search(a.issue_type + a.description):
+            continue
+        # 4. 无权威依据的主观措辞意见直接删除（非事实类）
+        if _UNVERIFIED.search(a.reference) and not _FACTUAL.search(a.issue_type):
+            continue
+        # 5. 推断式结论（"根据…推断/推测"）——无客观依据，删除
+        if _INFERENCE.search(a.description):
+            continue
+        # 6. "句末分号应改句号"断言：段后仍有内容时分号是正确的非末项分隔，
+        #    断言与文档结构不符 → 删除（不追 LLM 措辞变体，如"最后一项/末项/末条"）
+        if (
+            "分号" in a.description
+            and "句号" in a.description
+            and any(i > a.paragraph_index for i in nonempty_indices)
+        ):
+            continue
+        kept.append(a)
+    return kept
 
 
 class ReviewOrchestrator:
@@ -94,9 +158,21 @@ class ReviewOrchestrator:
 
         logger.info("Step 3/6: 检索完成, %d 条参考材料", len(refs))
 
-        # ── Step 4: 逐段对比审核（标准来自技能，文种来自分析结果）──
+        # ── Step 4a: 格式要素确定性审核（基于 docmodel 结构模型，不依赖 LLM）──
         try:
-            annotations = await compare_paragraphs(
+            format_annotations = format_checker.check(
+                paragraphs,
+                doc_type=analysis.get("doc_type"),
+                today=datetime.date.today(),
+            )
+        except Exception as e:
+            logger.error("格式审核失败: %s", e)
+            format_annotations = []
+        logger.info("Step 4a/6: 格式审核完成, %d 条批注", len(format_annotations))
+
+        # ── Step 4b: LLM 内容审核（标准来自技能，文种来自分析结果）──
+        try:
+            content_annotations = await compare_paragraphs(
                 paragraphs=paragraphs,
                 refs=refs,
                 skill=skill,
@@ -106,7 +182,15 @@ class ReviewOrchestrator:
             logger.error("审核失败: %s", e)
             return {"error": f"审核过程出错: {e}"}
 
-        logger.info("Step 4/6: 审核完成, %d 条批注", len(annotations))
+        # ── 区域策略：LLM 内容批注过滤（无依据主观建议删除/结构意见不报/
+        #    标题块/落款/附件页仅放行文本错误/日期矛盾幻觉撤销）──
+        content_annotations = _apply_region_policy(content_annotations, paragraphs)
+
+        annotations = format_annotations + content_annotations
+        logger.info(
+            "Step 4/6: 审核完成, %d 条批注 (格式 %d + 内容 %d)",
+            len(annotations), len(format_annotations), len(content_annotations),
+        )
 
         # ── Step 5: 过滤 ──
         annotations = self._filter(annotations)

@@ -14,6 +14,26 @@ from .models import Annotation, Paragraph
 
 logger = logging.getLogger(__name__)
 
+# 同时进行的 LLM 审核调用上限（批次并发；避免长文档触发 API 限流）
+MAX_CONCURRENT_BATCHES = 3
+
+# 区域标签（docmodel 结构模型 → prompt 结构化视图）
+_REGION_LABEL = {
+    "TITLE_BLOCK": "标题",
+    "BODY": "正文",
+    "SIGNATURE": "落款",
+    "ATTACHMENT_LIST": "附件说明",
+    "ATTACHMENT_PAGES": "附件页",
+}
+
+
+def _format_paragraphs_view(paragraphs: List[Paragraph]) -> str:
+    """结构化段落视图：标注区域，LLM 无需再推断文档结构。"""
+    return "\n".join(
+        f"[段落 {p.index}][{_REGION_LABEL.get(p.region, '正文')}] {p.text}"
+        for p in paragraphs
+    )
+
 
 async def compare_paragraphs(
     paragraphs: List[Paragraph],
@@ -22,7 +42,7 @@ async def compare_paragraphs(
     batch_size: int = 8,
     doc_type: Optional[str] = None,
 ) -> List[Annotation]:
-    """分批对比审核。
+    """分批对比审核（批次并发执行，信号量限流）。
 
     技能注入点：
     - skill.review_standard  → 审核标准 + 防编造约束（作为 system prompt）
@@ -38,32 +58,37 @@ async def compare_paragraphs(
     # 构建系统级审核 prompt（标准来自技能，文种决定格式标准）
     review_system_prompt = _build_review_system_prompt(skill, doc_type)
 
-    # 分批处理
+    # 分批并发执行（信号量限流；批次间无共享状态）
     total_batches = (len(paragraphs) + batch_size - 1) // batch_size
-    for i in range(0, len(paragraphs), batch_size):
-        batch = paragraphs[i : i + batch_size]
-        batch_num = i // batch_size + 1
+    sem = asyncio.Semaphore(MAX_CONCURRENT_BATCHES)
 
-        paragraphs_text = "\n\n".join(
-            f"[段落 {p.index}] {p.text}" for p in batch
-        )
+    async def process_batch(start: int) -> List[Annotation]:
+        batch = paragraphs[start : start + batch_size]
+        batch_num = start // batch_size + 1
+
+        paragraphs_text = _format_paragraphs_view(batch)
 
         user_prompt = _build_user_prompt(reference_text, paragraphs_text)
 
-        try:
-            response = await _call_llm_with_system(
-                system_prompt=review_system_prompt,
-                user_prompt=user_prompt,
-            )
-            batch_annotations = _parse_annotations(response)
-            all_annotations.extend(batch_annotations)
-            logger.info("批次 %d/%d 完成, 发现 %d 条问题", batch_num, total_batches, len(batch_annotations))
-        except Exception as e:
-            logger.error("批次 %d/%d 审核失败: %s", batch_num, total_batches, e)
+        async with sem:
+            try:
+                response = await _call_llm_with_system(
+                    system_prompt=review_system_prompt,
+                    user_prompt=user_prompt,
+                )
+            except Exception as e:
+                logger.error("批次 %d/%d 审核失败: %s", batch_num, total_batches, e)
+                return []
 
-        # 避免 API 限流
-        if i + batch_size < len(paragraphs):
-            await asyncio.sleep(1)
+        batch_annotations = _parse_annotations(response)
+        logger.info("批次 %d/%d 完成, 发现 %d 条问题", batch_num, total_batches, len(batch_annotations))
+        return batch_annotations
+
+    results = await asyncio.gather(
+        *(process_batch(i) for i in range(0, len(paragraphs), batch_size))
+    )
+    for batch_annotations in results:
+        all_annotations.extend(batch_annotations)
 
     return all_annotations
 
@@ -84,7 +109,21 @@ def _build_review_system_prompt(skill: ReviewSkill, doc_type: Optional[str]) -> 
 ## 审核范围
 
 1. 政策符合性审核：将公文与参考材料对比，检查政策引用是否过期、内容是否与官方发布存在冲突。
-2. 语言与格式审核：检查错别字、语句表达、用词规范性、文章结构合理性及公文格式合规性。
+2. 语言审核：只审核错别字、语句表达、用词规范性、标点使用、引用和数据错误。
+
+## 输出约束（硬性，违反视为不合格输出）
+
+1. 段落前的[区域]标签标明文档结构。标题区、落款区、附件页区（落款后的
+   「附件N」及附件标题）的格式要素已由系统确定性检查，这些区域**只接受
+   明确的文本错误**（错别字、漏字、应为、写错等），不得报告格式、缺失、
+   位置、简洁性等问题。
+2. 不得报告格式要素问题：标题三要素（发文机关/事由/文种）、主送机关、
+   落款署名、成文日期（含格式、与当前日期的关系——成文日期早于当前日期
+   属正常，印发后审核）、附件说明、章节序号（含 Word 自动编号渲染后的序号）。
+3. 不得报告"缺少通知缘由"等结构合理性意见。
+4. 不得输出仅凭个人语感、无客观依据的措辞偏好（如"可更精炼""略显口语化"）；
+   每条批注必须有明确的客观依据（错别字、搭配不当、事实错误、与参考材料矛盾）。
+5. 文种未识别时按通用公文规范审核。
 
 ## 审核标准（来自 document-review 技能）
 

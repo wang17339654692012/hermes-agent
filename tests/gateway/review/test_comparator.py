@@ -233,6 +233,43 @@ class TestCompareParagraphs:
 
     @patch("gateway.platforms.review.comparator._call_llm_with_system")
     @pytest.mark.asyncio
+    async def test_batches_run_concurrently_but_bounded(self, mock_llm):
+        """批次之间无数据依赖：并发执行；信号量将并发上限限制在 3。"""
+        import asyncio
+
+        from gateway.platforms.review.comparator import MAX_CONCURRENT_BATCHES
+
+        entries = 0
+        reached_cap = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_call(**kwargs):
+            nonlocal entries
+            entries += 1
+            if entries == MAX_CONCURRENT_BATCHES:
+                reached_cap.set()
+            await release.wait()
+            return "[]"
+
+        mock_llm.side_effect = slow_call
+
+        skill = ReviewSkill(review_standard="标准", extract_chars=5000)
+        paragraphs = [Paragraph(index=i, text=f"段落{i}") for i in range(1, 41)]
+
+        task = asyncio.create_task(
+            compare_paragraphs(paragraphs=paragraphs, refs=[], skill=skill, batch_size=8)
+        )
+        # 等信号量被占满（3 个批次并发执行中）
+        await asyncio.wait_for(reached_cap.wait(), timeout=5)
+        assert entries == MAX_CONCURRENT_BATCHES  # 并发被信号量封顶
+        await asyncio.sleep(0.05)
+        assert entries == MAX_CONCURRENT_BATCHES  # 第 4 个批次被信号量阻塞
+        release.set()
+        await task
+        assert mock_llm.call_count == 5  # 40/8 = 5 batches
+
+    @patch("gateway.platforms.review.comparator._call_llm_with_system")
+    @pytest.mark.asyncio
     async def test_doc_type_passed_into_system_prompt(self, mock_llm):
         """doc_type 必须注入审核 prompt，模型才能按文种聚焦格式标准。"""
         mock_llm.return_value = "[]"
