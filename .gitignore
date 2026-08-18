@@ -201,3 +201,15 @@ native/fts5_cjk/*.so
 
 # Docker 交付镜像包（构建产物，见 deploy/review/tools/build-and-export.sh）
 deploy/review/dist/
+
+# ── 公文审核：批注分析会话产物（禁止提交）──
+# 审核输出 docx 副本、解析/校验文本、复审核 json、Word 临时锁文件
+docs/*_reviewed.docx
+docs/*_original.docx
+docs/dump_*.txt
+docs/verify_*.txt
+docs/recheck*.json
+docs/t07_repro.json
+docs/~$*
+# 会话期验证脚本（一次性分析用，非交付代码）
+scripts/verify_*.py
