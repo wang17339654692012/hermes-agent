@@ -99,6 +99,21 @@ class TestTitle:
         anns = check(paras, doc_type="通知", today=TODAY)
         assert any("标题" in a.issue_type for a in anns)
 
+    def test_all_genres_recognized(self):
+        """15 种法定文种标题 → 文种齐全，不报缺文种。"""
+        genres = [
+            "决议", "决定", "命令", "公报", "公告", "通告", "意见",
+            "通知", "通报", "报告", "请示", "批复", "议案", "函", "纪要",
+        ]
+        for g in genres:
+            paras = _pars(
+                "济南能源集团有限公司",
+                f"关于开展安全生产检查的{g}",
+                "一、检查目的",
+            )
+            anns = check(paras, doc_type="通知", today=TODAY)
+            assert not [a for a in anns if "标题" in a.issue_type], g
+
 
 class TestSender:
     def test_sender_present_no_annotation(self):
@@ -125,8 +140,8 @@ class TestSender:
         assert len(sender) == 1
 
     def test_public_genre_no_sender_not_reported(self):
-        """公告/通告（公布性文种）本无主送机关 → 不报缺失。"""
-        for genre in ("公告", "通告"):
+        """公告/通告/公报/决议/命令（公布性文种）本无主送机关 → 不报缺失。"""
+        for genre in ("公告", "通告", "公报", "决议", "命令"):
             paras = _pars(
                 f"关于开展安全生产检查的{genre}",
                 "一、检查目的",
