@@ -11,17 +11,19 @@ from lxml import etree
 from .models import Annotation
 
 
-# ─── 高亮颜色映射 ───
-SEVERITY_COLORS = {
-    "critical":    "FF0000",   # 🔴 红色
-    "important":   "FFC000",   # 🟡 黄色
-    "suggestion":  "00B050",   # 🔵 绿色
+# ─── 级别标签（彩色圆点 + 文字；● U+25CF 几乎所有字体都带，
+#     不依赖 emoji 字形，Word/WPS 均正常显示）───
+SEVERITY_LABELS = {
+    "critical":    "● 严重",
+    "important":   "● 重要",
+    "suggestion":  "● 建议",
 }
 
-SEVERITY_LABELS = {
-    "critical":    "🔴 严重",
-    "important":   "🟡 重要",
-    "suggestion":  "🔵 建议",
+# 级别标签颜色（w:color 渲染器属性，任何客户端强制生效）
+SEVERITY_LABEL_COLORS = {
+    "critical":    "FF0000",   # 红
+    "important":   "BF8F00",   # 橙/深黄（浅黄文字不可读）
+    "suggestion":  "0070C0",   # 蓝
 }
 
 
@@ -54,7 +56,7 @@ def _generate_sync(
     for a in annotations:
         anno_map.setdefault(a.paragraph_index, []).append(a)
 
-    # ── 第 1 步：逐段添加 Comment 和高亮 ──
+    # ── 第 1 步：逐段添加 Comment ──
     # 解析器 index 即 document.paragraphs 的枚举序号（含空段，见 parser.py），
     # 因此按文档位置锚定，避免文本匹配在重复段落时错位。
     for doc_idx, para in enumerate(doc.paragraphs, start=1):
@@ -63,7 +65,6 @@ def _generate_sync(
 
         for anno in anno_map[doc_idx]:
             _add_comment(doc, para, anno)
-            _highlight_paragraph(para, anno.severity)
 
     # ── 第 2 步：将 comments 的 lxml 修改写回 Part blob ──
     _flush_comments(doc)
@@ -128,27 +129,18 @@ def _add_comment(doc: Document, para, anno: Annotation) -> None:
         f"参考依据：{anno.reference}"
     )
 
-    for line in comment_text.split("\n"):
+    for idx, line in enumerate(comment_text.split("\n")):
         p = etree.SubElement(comment, qn("w:p"))
         r = etree.SubElement(p, qn("w:r"))
-        etree.SubElement(r, qn("w:rPr"))
+        r_pr = etree.SubElement(r, qn("w:rPr"))
+        # 级别行（第一行）：着色 + 加粗，替代 emoji 区分级别
+        if idx == 0:
+            color = etree.SubElement(r_pr, qn("w:color"))
+            color.set(qn("w:val"), SEVERITY_LABEL_COLORS.get(anno.severity, "000000"))
+            etree.SubElement(r_pr, qn("w:b"))
         t = etree.SubElement(r, qn("w:t"))
         t.text = line
         t.set(qn("xml:space"), "preserve")
-
-
-def _highlight_paragraph(para, severity: str) -> None:
-    """对段落中的所有 Run 应用高亮背景色"""
-    color = SEVERITY_COLORS.get(severity, "FFFF00")
-
-    for run in para.runs:
-        rPr = run._element.find(qn("w:rPr"))
-        if rPr is None:
-            rPr = etree.SubElement(run._element, qn("w:rPr"))
-            run._element.insert(0, rPr)
-
-        highlight = etree.SubElement(rPr, qn("w:highlight"))
-        highlight.set(qn("w:val"), color)
 
 
 def _ensure_comments_part(doc: Document):

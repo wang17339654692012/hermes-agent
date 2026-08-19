@@ -11,8 +11,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from gateway.platforms.review.annotator import (
     generate_annotated_docx,
     _generate_sync,
-    SEVERITY_COLORS,
     SEVERITY_LABELS,
+    SEVERITY_LABEL_COLORS,
 )
 from gateway.platforms.review.models import Annotation
 from docx.oxml.ns import qn
@@ -54,15 +54,23 @@ def _make_test_annotations() -> list:
 class TestSeverityConstants:
     """常量测试."""
 
-    def test_colors_defined(self):
-        assert SEVERITY_COLORS["critical"] == "FF0000"
-        assert SEVERITY_COLORS["important"] == "FFC000"
-        assert SEVERITY_COLORS["suggestion"] == "00B050"
-
     def test_labels_defined(self):
-        assert "严重" in SEVERITY_LABELS["critical"]
-        assert "重要" in SEVERITY_LABELS["important"]
-        assert "建议" in SEVERITY_LABELS["suggestion"]
+        assert SEVERITY_LABELS["critical"] == "● 严重"
+        assert SEVERITY_LABELS["important"] == "● 重要"
+        assert SEVERITY_LABELS["suggestion"] == "● 建议"
+
+    def test_label_colors_defined(self):
+        assert SEVERITY_LABEL_COLORS["critical"] == "FF0000"
+        assert SEVERITY_LABEL_COLORS["important"] == "BF8F00"
+        assert SEVERITY_LABEL_COLORS["suggestion"] == "0070C0"
+
+    def test_labels_no_emoji(self):
+        """级别标签用 ●(U+25CF) + 着色，不用 emoji——emoji 在 WPS 缺字形显示方块。"""
+        for label in SEVERITY_LABELS.values():
+            assert "🔴" not in label
+            assert "🟡" not in label
+            assert "🔵" not in label
+            assert "●" in label
 
 
 class TestGenerateAnnotatedDocx:
@@ -138,6 +146,39 @@ class TestGenerateAnnotatedDocx:
             ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
             comments = root.findall(".//w:comment", ns)
             assert len(comments) == 2  # 2 annotations
+
+    def test_comment_label_colored_no_emoji(self):
+        """批注气泡首行（级别行）彩色圆点 + 着色，无 emoji。"""
+        import zipfile
+
+        file_bytes = _make_test_docx()
+        annotations = _make_test_annotations()
+
+        result = _generate_sync(file_bytes, "test.docx", annotations)
+
+        with zipfile.ZipFile(BytesIO(result), "r") as z:
+            xml = z.read("word/comments.xml").decode("utf-8")
+
+        # 级别行带 w:color（critical → FF0000），含圆点，无 emoji 字符
+        assert 'w:val="FF0000"' in xml
+        assert "● 严重" in xml
+        for ch in ("🔴", "🟡", "🔵"):
+            assert ch not in xml
+
+    def test_no_paragraph_background(self):
+        """正文段落不添加背景色/高亮（批注级别靠气泡标签区分）。"""
+        import zipfile
+
+        file_bytes = _make_test_docx()
+        annotations = _make_test_annotations()
+
+        result = _generate_sync(file_bytes, "test.docx", annotations)
+
+        with zipfile.ZipFile(BytesIO(result), "r") as z:
+            xml = z.read("word/document.xml").decode("utf-8")
+
+        assert "w:shd" not in xml
+        assert "w:highlight" not in xml
 
     def test_duplicate_text_paragraphs_anchored_by_position(self):
         """相同文本的两个段落，批注按文档位置锚定而非文本匹配。
