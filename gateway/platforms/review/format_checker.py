@@ -50,6 +50,11 @@ _STRICT_DATE_PATTERN = re.compile(r"\d{4}年(?:[1-9]|1[0-2])月(?:[1-9]|[12]\d|3
 # 正文中不带年份的月日
 _MONTH_DAY_PATTERN = re.compile(r"(\d{1,2})月(\d{1,2})日")
 
+# 主送机关按文种要求：公布性文种（公告/通告/公报）与纪要（出席/列席体系）
+# 本无主送机关，不报缺失；其余文种（通知/报告/请示/批复/函/通报/意见/决定
+# 等）与未知文种一律要求（保守：宁多报不漏报）。
+_SENDER_OPTIONAL_GENRES = {"公告", "通告", "纪要", "公报"}
+
 
 def _ann(
     index: int,
@@ -90,8 +95,8 @@ def check(
     # ── 1. 标题三要素 ──
     _check_title(annotations, doc, doc_type)
 
-    # ── 2. 主送机关 ──
-    _check_sender(annotations, doc)
+    # ── 2. 主送机关（按文种要求）──
+    _check_sender(annotations, doc, doc_type)
 
     # ── 3. 落款（署名 + 成文日期）与成文日期格式 ──
     sign_date = _check_signature(annotations, doc, today)
@@ -143,8 +148,14 @@ def _check_title(
         ))
 
 
-def _check_sender(annotations: List[Annotation], doc) -> None:
-    """主送机关：正文区存在 role=sender 的行。"""
+def _check_sender(annotations: List[Annotation], doc, doc_type: Optional[str]) -> None:
+    """主送机关：正文区存在 role=sender 的行。
+
+    公告/通告/公报（公布性文种）与纪要本无主送机关，跳过检查；
+    其余文种与未知文种一律要求（保守）。
+    """
+    if doc_type and doc_type in _SENDER_OPTIONAL_GENRES:
+        return
     if any(p.role == "sender" for p in doc.paragraphs):
         return
     anchor = doc.first_marker or (min(doc.title_block) if doc.title_block else 1)

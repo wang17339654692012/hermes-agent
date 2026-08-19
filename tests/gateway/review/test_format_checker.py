@@ -124,6 +124,41 @@ class TestSender:
         sender = [a for a in anns if "主送机关" in a.issue_type]
         assert len(sender) == 1
 
+    def test_public_genre_no_sender_not_reported(self):
+        """公告/通告（公布性文种）本无主送机关 → 不报缺失。"""
+        for genre in ("公告", "通告"):
+            paras = _pars(
+                f"关于开展安全生产检查的{genre}",
+                "一、检查目的",
+                "济南能源集团有限公司",
+                "2026年6月15日",
+            )
+            anns = check(paras, doc_type=genre, today=TODAY)
+            assert not [a for a in anns if "主送机关" in a.issue_type], genre
+
+    def test_minutes_no_sender_not_reported(self):
+        """纪要采用出席/列席体系，无主送机关 → 不报缺失。"""
+        paras = _pars(
+            "安全生产专题会议纪要",
+            "一、会议情况",
+            "济南能源集团有限公司",
+            "2026年6月15日",
+        )
+        anns = check(paras, doc_type="纪要", today=TODAY)
+        assert not [a for a in anns if "主送机关" in a.issue_type]
+
+    def test_unknown_genre_no_sender_reported(self):
+        """文种未知时保守处理：仍要求主送机关。"""
+        paras = _pars(
+            "关于开展安全生产培训的通知",
+            "一、培训时间和地点",
+            "济南能源集团有限公司",
+            "2026年6月15日",
+        )
+        anns = check(paras, doc_type=None, today=TODAY)
+        sender = [a for a in anns if "主送机关" in a.issue_type]
+        assert len(sender) == 1
+
 
 class TestSignature:
     def _base(self, *tail: str) -> list:
