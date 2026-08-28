@@ -3,6 +3,11 @@
 from dataclasses import dataclass, field
 from typing import Optional, List
 
+# 纯内容审核文种：非《党政机关公文处理工作条例》15 种法定公文。
+# 这类文种只做内容审核（政策符合性 + 事实 + 语言）与防编造约束，
+# 跳过公文格式要素的确定性检查（标题三要素/主送机关/落款/附件/序号等）。
+CONTENT_ONLY_DOC_TYPES = frozenset({"宣传稿件"})
+
 
 @dataclass
 class Paragraph:

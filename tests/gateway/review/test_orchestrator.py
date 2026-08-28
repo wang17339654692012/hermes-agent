@@ -577,6 +577,40 @@ class TestRegionPolicy:
         kept = _apply_region_policy(annos, paras)
         assert len(kept) == 1
 
+    def test_content_only_keeps_title_block_format_claim(self):
+        """纯内容文种（宣传稿件）：跳过公文格式区域限制，标题块格式类批注保留。"""
+        paras = self._paras_with_regions()
+        annos = [self._mk(1, "政治表述", "标题只有机关名称，缺少事由和文种", "r")]
+        kept = _apply_region_policy(annos, paras, content_only=True)
+        assert len(kept) == 1
+
+    def test_content_only_keeps_date_claim(self):
+        """纯内容文种：跳过日期类意见撤销（无确定性格式检查兜底）。"""
+        paras = self._paras_with_regions()
+        annos = [
+            self._mk(6, "日期错误", "培训时间为2026年6月17日至18日，但成文日期早于该时间。", "r", severity="critical")
+        ]
+        kept = _apply_region_policy(annos, paras, content_only=True)
+        assert len(kept) == 1
+
+    def test_content_only_still_drops_unverified_subjective(self):
+        """防编造过滤在纯内容文种下仍生效：无权威依据主观意见删除。"""
+        paras = self._paras_with_regions()
+        annos = [self._mk(8, "用词规范性", "M8 表述不规范", "未在权威来源中检索到对应表述，请人工核实")]
+        assert _apply_region_policy(annos, paras, content_only=True) == []
+
+    def test_content_only_still_drops_inference(self):
+        """防编造过滤在纯内容文种下仍生效：推断式结论删除。"""
+        paras = self._paras_with_regions()
+        annos = [
+            self._mk(
+                6, "错别字",
+                "年份存在笔误。根据公文内容推断，该通知涉及的培训规划依据为《规划（2024—2028年）》。",
+                "r", severity="critical",
+            )
+        ]
+        assert _apply_region_policy(annos, paras, content_only=True) == []
+
 
 class TestRunMergesFormatAndContent:
     """run() 合并确定性格式批注 + LLM 内容批注（真实 format_checker）。"""
@@ -628,3 +662,42 @@ class TestRunMergesFormatAndContent:
         assert "错别字" in types
         assert "政治表述" not in types
         assert "用词规范性" not in types
+
+
+class TestRunContentOnlySkipsFormat:
+    """宣传稿件（纯内容文种）：跳过格式审核，仅内容审核 + 防编造过滤。"""
+
+    @patch("gateway.platforms.review.orchestrator.load_review_skill")
+    @patch("gateway.platforms.review.orchestrator.parse_document")
+    @patch("gateway.platforms.review.orchestrator._call_llm")
+    @patch("gateway.platforms.review.orchestrator.multi_round_search")
+    @patch("gateway.platforms.review.orchestrator.compare_paragraphs")
+    @patch("gateway.platforms.review.format_checker.check")
+    @pytest.mark.asyncio
+    async def test_content_only_skips_format_check(
+        self, mock_format_check, mock_compare, mock_search, mock_llm, mock_parse, mock_load
+    ):
+        from gateway.platforms.review.skill_loader import ReviewSkill
+
+        mock_load.return_value = ReviewSkill(
+            review_standard="标准",
+            search_platforms=[{"name": "党建网", "domain": "dangjian.cn"}],
+        )
+        mock_parse.return_value = [Paragraph(index=1, text="宣传稿正文")]
+        mock_llm.return_value = (
+            '{"themes": ["党建"], "expressions": [], "references": [], "doc_type": "宣传稿件"}'
+        )
+        mock_search.return_value = []
+        mock_compare.return_value = []
+
+        orch = ReviewOrchestrator(
+            file_bytes=b"test", filename="test.docx", annotate=False,
+        )
+        result = await orch.run()
+
+        assert "error" not in result
+        # 纯内容文种跳过确定性格式审核
+        mock_format_check.assert_not_called()
+        # 内容审核仍执行，且透传文种
+        assert mock_compare.await_count == 1
+        assert mock_compare.call_args.kwargs["doc_type"] == "宣传稿件"

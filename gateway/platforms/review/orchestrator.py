@@ -17,7 +17,7 @@ import aiohttp
 from . import format_checker
 from .docmodel import REGION_ATTACHMENT_LIST, REGION_ATTACHMENT_PAGES, REGION_SIGNATURE, REGION_TITLE_BLOCK
 from .skill_loader import load_review_skill, ReviewSkill
-from .models import Annotation, Paragraph
+from .models import CONTENT_ONLY_DOC_TYPES, Annotation, Paragraph
 from .parser import parse_document
 from .retriever import multi_round_search
 from .comparator import compare_paragraphs
@@ -51,8 +51,15 @@ _NON_REVIEW_REGIONS = {REGION_TITLE_BLOCK, REGION_SIGNATURE, REGION_ATTACHMENT_P
 def _apply_region_policy(
     annotations: List[Annotation],
     paragraphs: List[Paragraph],
+    content_only: bool = False,
 ) -> List[Annotation]:
-    """对 LLM 内容批注执行区域策略（只作用于 content_annotations）。"""
+    """对 LLM 内容批注执行区域策略（只作用于 content_annotations）。
+
+    content_only=True（纯内容文种，如宣传稿件）时：
+    - 跳过公文格式区域限制（标题块/落款/附件页仅放行文本错误）；
+    - 跳过日期类意见撤销（无确定性格式检查兜底）；
+    - 防编造过滤（无权威依据主观意见、推断式结论）始终生效。
+    """
     by_index = {p.index: p for p in paragraphs}
     nonempty_indices = sorted(p.index for p in paragraphs if p.text.strip())
     kept: List[Annotation] = []
@@ -61,18 +68,23 @@ def _apply_region_policy(
         region = p.region if p is not None else ""
 
         # 1. 标题块 / 落款 / 附件页：格式要素由系统确定性检查，仅放行文本错误类
-        if region in _NON_REVIEW_REGIONS and not _CN_TYPO_TYPE.search(a.issue_type):
+        #    （纯内容文种无公文格式要素，跳过此区域限制）
+        if (
+            not content_only
+            and region in _NON_REVIEW_REGIONS
+            and not _CN_TYPO_TYPE.search(a.issue_type)
+        ):
             continue
         # 2. 结构意见（缺通知缘由等）不报
         if _STRUCTURAL_OPINION.search(a.issue_type):
             continue
-        # 3. 日期类意见撤销（格式检查已确定性处理）
-        if _DATE_CLAIM.search(a.issue_type + a.description):
+        # 3. 日期类意见撤销（格式检查已确定性处理；纯内容文种无此兜底，不撤销）
+        if not content_only and _DATE_CLAIM.search(a.issue_type + a.description):
             continue
-        # 4. 无权威依据的主观措辞意见直接删除（非事实类）
+        # 4. 无权威依据的主观措辞意见直接删除（非事实类）——防编造，始终生效
         if _UNVERIFIED.search(a.reference) and not _FACTUAL.search(a.issue_type):
             continue
-        # 5. 推断式结论（"根据…推断/推测"）——无客观依据，删除
+        # 5. 推断式结论（"根据…推断/推测"）——无客观依据，删除——防编造，始终生效
         if _INFERENCE.search(a.description):
             continue
         # 6. "句末分号应改句号"断言：段后仍有内容时分号是正确的非末项分隔，
@@ -144,6 +156,9 @@ class ReviewOrchestrator:
                      len(analysis.get("expressions", [])),
                      len(analysis.get("references", [])))
 
+        doc_type = analysis.get("doc_type")
+        content_only = doc_type in CONTENT_ONLY_DOC_TYPES
+
         # ── Step 3: 多轮检索（策略来自技能）──
         try:
             refs = await multi_round_search(
@@ -159,15 +174,20 @@ class ReviewOrchestrator:
         logger.info("Step 3/6: 检索完成, %d 条参考材料", len(refs))
 
         # ── Step 4a: 格式要素确定性审核（基于 docmodel 结构模型，不依赖 LLM）──
-        try:
-            format_annotations = format_checker.check(
-                paragraphs,
-                doc_type=analysis.get("doc_type"),
-                today=datetime.date.today(),
-            )
-        except Exception as e:
-            logger.error("格式审核失败: %s", e)
+        # 纯内容文种（宣传稿件等）无公文格式要素，跳过确定性格式审核。
+        if content_only:
             format_annotations = []
+            logger.info("Step 4a/6: 跳过格式审核（%s 仅做内容审核）", doc_type)
+        else:
+            try:
+                format_annotations = format_checker.check(
+                    paragraphs,
+                    doc_type=doc_type,
+                    today=datetime.date.today(),
+                )
+            except Exception as e:
+                logger.error("格式审核失败: %s", e)
+                format_annotations = []
         logger.info("Step 4a/6: 格式审核完成, %d 条批注", len(format_annotations))
 
         # ── Step 4b: LLM 内容审核（标准来自技能，文种来自分析结果）──
@@ -176,7 +196,7 @@ class ReviewOrchestrator:
                 paragraphs=paragraphs,
                 refs=refs,
                 skill=skill,
-                doc_type=analysis.get("doc_type"),
+                doc_type=doc_type,
             )
         except Exception as e:
             logger.error("审核失败: %s", e)
@@ -184,7 +204,9 @@ class ReviewOrchestrator:
 
         # ── 区域策略：LLM 内容批注过滤（无依据主观建议删除/结构意见不报/
         #    标题块/落款/附件页仅放行文本错误/日期矛盾幻觉撤销）──
-        content_annotations = _apply_region_policy(content_annotations, paragraphs)
+        content_annotations = _apply_region_policy(
+            content_annotations, paragraphs, content_only=content_only
+        )
 
         annotations = format_annotations + content_annotations
         logger.info(
@@ -260,7 +282,7 @@ class ReviewOrchestrator:
 1. 文档主题（3-5 个关键词）
 2. 关键政治表述（需要与权威来源核对的固定提法）
 3. 引用的文件、会议、讲话（需要验证准确性和时效性）
-4. 公文文种（《党政机关公文处理工作条例》15 种法定文种：决议、决定、命令（令）、公报、公告、通告、意见、通知、通报、报告、请示、批复、议案、函、纪要；无法判断时输出"未知"）
+4. 公文文种（《党政机关公文处理工作条例》15 种法定文种：决议、决定、命令（令）、公报、公告、通告、意见、通知、通报、报告、请示、批复、议案、函、纪要；此外支持"宣传稿件"这一非公文文种，只做内容审核，不做格式要素审核；无法判断时输出"未知"）
 
 ## 审核标准（来自 document-review 技能）
 

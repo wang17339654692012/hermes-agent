@@ -45,6 +45,15 @@ class TestBuildReviewSystemPrompt:
         assert "语言" in prompt or "格式" in prompt
         assert "参考材料" in prompt
 
+    def test_content_only_doc_type_decl(self):
+        """纯内容文种（宣传稿件）：声明只做内容审核 + 防编造，不按公文格式规范审核。"""
+        skill = ReviewSkill(review_standard="标准")
+        prompt = _build_review_system_prompt(skill, doc_type="宣传稿件")
+        assert "宣传稿件" in prompt
+        assert "仅做内容审核" in prompt
+        assert "不做公文格式要素审核" in prompt
+        assert "防编造" in prompt
+
 
 class TestBuildUserPrompt:
     """_build_user_prompt tests — 空检索时的防编造显式指令。"""

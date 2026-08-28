@@ -10,7 +10,7 @@ from typing import List, Optional
 import aiohttp
 
 from .skill_loader import ReviewSkill
-from .models import Annotation, Paragraph
+from .models import CONTENT_ONLY_DOC_TYPES, Annotation, Paragraph
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +95,12 @@ async def compare_paragraphs(
 
 def _build_review_system_prompt(skill: ReviewSkill, doc_type: Optional[str]) -> str:
     """构建逐段审核的 system prompt（标准来自技能，文种决定格式标准）。"""
-    if doc_type:
+    if doc_type in CONTENT_ONLY_DOC_TYPES:
+        doc_type_decl = (
+            f"本文种为{doc_type}（非公文文种），仅做内容审核：政策符合性、事实准确性、语言规范；"
+            "不做公文格式要素审核，严格遵循防编造约束。"
+        )
+    elif doc_type:
         doc_type_decl = f"本文种为：{doc_type}。请按该文种的格式规范审核。"
     else:
         doc_type_decl = "文种未识别，请勿假设文种，按通用公文规范审核。"
